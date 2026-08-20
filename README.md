@@ -39,7 +39,7 @@ defense, not the agent's good behavior.
 2. **Config** — `cp config.example.toml config.toml` and set your username
    and repos.
 
-3. **Run**:
+3. **Run the daemon** (foreground in a terminal is fine; a service is optional):
 
    ```sh
    cargo run --release            # uses ./config.toml
@@ -47,6 +47,33 @@ defense, not the agent's good behavior.
    ```
 
    Log verbosity: `RUST_LOG=kwkly=debug cargo run --release`.
+
+## CLI
+
+The daemon is headless; these subcommands are the interactive layer (run them
+from any terminal while the daemon runs — they read the same inbox):
+
+```sh
+kwkly status     # table of tracked PRs: state, diff ready?, reviewed?
+kwkly review     # walk unreviewed finished tasks one at a time
+kwkly prune      # delete task dirs for PRs that merged/closed (asks first)
+kwkly [daemon]   # the watcher itself
+```
+
+`kwkly review` shows each task's `PLAN.md`, then prompts:
+
+| Key | Action |
+|---|---|
+| `p` / `d` | show PLAN.md / show the diff (git pager) |
+| `a` | apply `changes.patch` onto your real checkout (`git apply --3way`) |
+| `o` | open interactive `claude` in the worktree to iterate |
+| `x` | discard the worktree changes |
+| `e` | show the agent's stderr log (for failed tasks) |
+| `m` / `s` / `q` | mark reviewed / skip for now / quit |
+
+Only the daemon writes `state.json` — a lock file (`daemon.lock`) enforces one
+daemon per `inbox_dir`, so a second instance fails loudly instead of racing.
+Run multiple daemons only with separate configs *and* separate `inbox_dir`s.
 
 ## Reviewing a task
 
@@ -66,9 +93,9 @@ into the worktree and run interactive `claude` — it's a normal checkout.
 When happy, cherry-pick/apply onto your real checkout (or commit and push
 from the worktree yourself). Discard with `git -C worktree checkout .`.
 
-When a PR is merged/closed its state entry is dropped automatically; on-disk
-worktrees are left for you to prune:
-`git -C ~/agent-inbox/<repo>/clone worktree remove ../pr-<n>/worktree`.
+When a PR is merged/closed its state entry is dropped automatically; the
+on-disk task dir stays until you run `kwkly prune` (which confirms before
+deleting anything, including unreviewed changes).
 
 ## Behavior notes
 
@@ -161,5 +188,5 @@ How the two map:
 - Top-level PR review bodies (the "Approve/Request changes" summary text —
   only inline + conversation comments are watched)
 - Pagination past 100 open PRs / 100 new comments per poll
-- Automatic worktree pruning on PR close
+- A `confirm_dispatch` mode (approve each agent run before it starts)
 # kwkly

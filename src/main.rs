@@ -1,17 +1,29 @@
 mod agent;
+mod cli;
 mod config;
 mod github;
 mod notify;
 mod state;
 mod worktree;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use chrono::Utc;
 use state::TaskStatus;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
+
+const USAGE: &str = "\
+kwkly — watches your PRs for review comments, prepares diffs locally
+
+USAGE:
+  kwkly [config.toml]            run the daemon (default config: ./config.toml)
+  kwkly daemon [config.toml]     same, explicit
+  kwkly status [config.toml]     list tracked PRs and finished tasks
+  kwkly review [config.toml]     walk unreviewed tasks interactively
+  kwkly prune  [config.toml]     delete task dirs for merged/closed PRs
+";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,10 +34,47 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".to_string());
-    let cfg = config::Config::load(&config_path)?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (mode, cfg_arg) = match args.first().map(|s| s.as_str()) {
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            return Ok(());
+        }
+        Some(m @ ("daemon" | "status" | "review" | "prune")) => (m, args.get(1)),
+        // Legacy form: bare positional arg is a config path for the daemon.
+        Some(_) => ("daemon", args.first()),
+        None => ("daemon", None),
+    };
+    let cfg_path = cfg_arg.map(|s| s.as_str()).unwrap_or("config.toml");
+    let cfg = config::Config::load(cfg_path)?;
+
+    match mode {
+        "status" => return cli::status(&cfg),
+        "review" => return cli::review(&cfg),
+        "prune" => return cli::prune(&cfg),
+        _ => {}
+    }
+
+    // ---- daemon path ----
     let token = cfg.github_token()?;
     std::fs::create_dir_all(&cfg.inbox_dir)?;
+
+    // One daemon per inbox_dir: state.json has a single writer. The OS lock
+    // is released automatically on any kind of process exit.
+    let lock_path = cfg.inbox_dir.join("daemon.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    match lock_file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "another kwkly daemon is already running against {} — \
+             one daemon per inbox_dir (use a separate inbox_dir per instance)",
+            cfg.inbox_dir.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+    }
 
     let gh = github::Gh::new(token.clone())?;
     let state_path = cfg.inbox_dir.join("state.json");
@@ -56,6 +105,7 @@ async fn main() -> Result<()> {
         }
     }
     st.save(&state_path)?;
+    drop(lock_file);
     Ok(())
 }
 
