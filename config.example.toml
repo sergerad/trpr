@@ -1,0 +1,36 @@
+# Copy to config.toml and edit. Run with: kwkly [path/to/config.toml]
+
+# Your GitHub login. Used to skip your own comments, and (with only_my_prs)
+# to watch only PRs you authored.
+username = "sergeradinovich"
+
+# Repositories to watch, "owner/name".
+repos = [
+  # "rust-lang/rust",
+]
+
+# Where clones, worktrees, and review artifacts land.
+inbox_dir = "~/agent-inbox"
+
+# How often to poll GitHub, and how long a PR must be "quiet" after the last
+# new comment before an agent run is dispatched (batches comment bursts).
+poll_interval_secs = 120
+debounce_secs = 300
+
+# Agent runtime.
+max_concurrent_agents = 2
+max_turns = 40
+claude_bin = "claude"
+
+# Only react to PRs you authored (false = all open PRs in the repo).
+only_my_prs = true
+
+# Env var holding a fine-grained PAT with READ-ONLY permissions:
+#   Contents: Read, Issues: Read, Pull requests: Read  (on the watched repos)
+# Read-only is the core safety guarantee — the agent physically cannot write
+# to GitHub even if a malicious comment tries to steer it.
+github_token_env = "KWKLY_GITHUB_TOKEN"
+
+# Desktop notifications when a task finishes.
+# macOS: uses osascript (built in). Linux: needs notify-send (libnotify).
+notifications = true
