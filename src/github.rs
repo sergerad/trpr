@@ -78,6 +78,10 @@ impl Gh {
         Ok(resp.json::<T>().await.with_context(|| format!("decoding {url}"))?)
     }
 
+    pub async fn pr(&self, repo: &str, number: u64) -> Result<Pr> {
+        self.get_json(&format!("{API}/repos/{repo}/pulls/{number}")).await
+    }
+
     pub async fn open_prs(&self, repo: &str) -> Result<Vec<Pr>> {
         let url = format!("{API}/repos/{repo}/pulls?state=open&per_page=100");
         let prs: Vec<Pr> = self.get_json(&url).await?;

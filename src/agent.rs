@@ -99,8 +99,9 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
         ctx.comments.clone()
     };
 
-    let clone = worktree::ensure_clone(&ctx.inbox_dir, &ctx.repo).await?;
-    let wt = worktree::prepare_worktree(&clone, task_dir, ctx.pr_number).await?;
+    let clone = worktree::ensure_clone(&ctx.inbox_dir, &ctx.repo, &ctx.github_token).await?;
+    let wt =
+        worktree::prepare_worktree(&clone, task_dir, ctx.pr_number, &ctx.github_token).await?;
     let task_dir_abs = std::fs::canonicalize(task_dir)?;
 
     // Per-task settings: the static template plus this task's absolute dir as

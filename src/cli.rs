@@ -263,6 +263,225 @@ pub fn prune(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------------- run ---
+
+/// What a `kwkly run` URL resolves to.
+pub struct RunTarget {
+    pub repo: String,
+    pub pr: u64,
+    /// A specific comment (from a #discussion_r / #issuecomment anchor), with
+    /// the comment kind the anchor implies.
+    pub comment: Option<CommentRef>,
+}
+
+pub struct CommentRef {
+    pub id: u64,
+    pub source: &'static str, // "review_comment" | "issue_comment"
+}
+
+/// Parse a GitHub PR or PR-comment URL:
+///   https://github.com/OWNER/REPO/pull/N                      → whole PR
+///   https://github.com/OWNER/REPO/pull/N#discussion_r<ID>     → inline review comment
+///   https://github.com/OWNER/REPO/pull/N/files#r<ID>          → same, files-tab anchor
+///   https://github.com/OWNER/REPO/pull/N#issuecomment-<ID>    → conversation comment
+pub fn parse_run_target(input: &str) -> Result<RunTarget> {
+    let s = input.trim();
+    let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    let rest = s
+        .strip_prefix("github.com/")
+        .context("expected a github.com URL like https://github.com/owner/repo/pull/123")?;
+
+    let (path, fragment) = match rest.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (rest, None),
+    };
+    let mut segs = path.trim_end_matches('/').split('/');
+    let owner = segs.next().filter(|v| !v.is_empty()).context("missing owner in URL")?;
+    let name = segs.next().filter(|v| !v.is_empty()).context("missing repo in URL")?;
+    match segs.next() {
+        Some("pull") => {}
+        Some("issues") => anyhow::bail!(
+            "that's an issue URL — kwkly handles pull requests only (for now)"
+        ),
+        _ => anyhow::bail!("expected .../pull/<number> in the URL"),
+    }
+    let pr: u64 = segs
+        .next()
+        .context("missing PR number in URL")?
+        .parse()
+        .context("PR number in URL is not a number")?;
+    // Trailing path segments (/files, /commits, …) are irrelevant — ignore.
+
+    let comment = match fragment {
+        None | Some("") => None,
+        Some(f) => {
+            if let Some(id) = f.strip_prefix("discussion_r").and_then(|v| v.parse().ok()) {
+                Some(CommentRef { id, source: "review_comment" })
+            } else if let Some(id) = f.strip_prefix("issuecomment-").and_then(|v| v.parse().ok()) {
+                Some(CommentRef { id, source: "issue_comment" })
+            } else if let Some(id) = f.strip_prefix('r').and_then(|v| v.parse().ok()) {
+                Some(CommentRef { id, source: "review_comment" })
+            } else if f.starts_with("pullrequestreview-") {
+                anyhow::bail!(
+                    "that anchor is a review summary, which kwkly doesn't handle yet — \
+                     link one of the review's inline comments (#discussion_r…) instead"
+                );
+            } else {
+                anyhow::bail!("unrecognized comment anchor '#{f}'");
+            }
+        }
+    };
+
+    Ok(RunTarget { repo: format!("{owner}/{name}"), pr, comment })
+}
+
+/// Trigger one agent run against a real PR immediately, bypassing polling and
+/// debounce. With a comment anchor: exactly that comment, no filtering.
+/// Without: all outstanding comments — everything the daemon hasn't already
+/// seen or queued (all of the PR's comments if it isn't tracked), bots
+/// excluded but own comments included, so commenting on your own PR works.
+/// Dispatches in the foreground and reports the artifact paths. Never writes
+/// state.json.
+pub async fn run_once(cfg: &Config, target: RunTarget) -> Result<()> {
+    let RunTarget { repo, pr: pr_number, comment } = target;
+    let repo = repo.as_str();
+    let token = cfg.github_token()?;
+    let gh = crate::github::Gh::new(token.clone())?;
+
+    let owner = repo.split('/').next().unwrap_or(repo);
+    let pr = gh.pr(repo, pr_number).await.with_context(|| {
+        format!(
+            "fetching PR #{pr_number} from {repo}. A GitHub 404 here usually means one of:\n\
+             - the token can't see the repo (private repo: the fine-grained PAT must have \
+             '{owner}' as its resource owner, with this repo granted — and the org must \
+             allow/approve fine-grained PATs)\n\
+             - #{pr_number} is an issue, not a pull request (kwkly handles PR comments only)"
+        )
+    })?;
+    let comments = gh
+        .new_comments(repo, pr_number, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
+        .await?;
+    if comments.is_empty() {
+        anyhow::bail!("PR #{pr_number} has no comments to run against");
+    }
+
+    let selected = match comment {
+        Some(cref) => {
+            let Some(c) = comments
+                .iter()
+                .find(|c| c.id == cref.id && c.source == cref.source)
+            else {
+                println!("Comment {} not found on PR #{pr_number}. Comments there:", cref.id);
+                for c in &comments {
+                    let mut body = c.body.replace('\n', " ");
+                    if body.len() > 70 {
+                        body.truncate(69);
+                        body.push('…');
+                    }
+                    println!("  {}\n    @{}: {}", c.html_url, c.user.login, body);
+                }
+                anyhow::bail!("pass one of the comment URLs above");
+            };
+            vec![c.clone()]
+        }
+        None => {
+            // "Outstanding" = the daemon's queued-but-undispatched comments,
+            // plus anything newer than its high-water mark. For an untracked
+            // PR that's simply every comment. State is read-only here.
+            let st = load_state(cfg)?;
+            let entry = st.repos.get(repo).and_then(|prs| prs.get(&pr_number));
+            let cutoff = entry.and_then(|e| e.last_seen_comment_at);
+            let mut sel: Vec<crate::github::Comment> =
+                entry.map(|e| e.pending_comments.clone()).unwrap_or_default();
+            let queued: std::collections::HashSet<u64> = sel.iter().map(|c| c.id).collect();
+            for c in &comments {
+                let is_bot = c.user.login.ends_with("[bot]")
+                    || c.user.kind.as_deref() == Some("Bot");
+                let outstanding = cutoff.map(|t| c.created_at > t).unwrap_or(true);
+                if outstanding && !is_bot && !queued.contains(&c.id) {
+                    sel.push(c.clone());
+                }
+            }
+            sel.sort_by_key(|c| c.created_at);
+            if sel.is_empty() {
+                anyhow::bail!(
+                    "no outstanding comments on PR #{pr_number} — the daemon has already \
+                     seen them all; pass a comment id to re-run against a specific one"
+                );
+            }
+            sel
+        }
+    };
+
+    println!("PR #{pr_number}: {}", pr.title);
+    for c in &selected {
+        let mut body = c.body.replace('\n', " ");
+        if body.len() > 100 {
+            body.truncate(99);
+            body.push('…');
+        }
+        println!("Testing against [{}] @{}: {}", c.source, c.user.login, body);
+    }
+
+    // Warn if a daemon holds this inbox — a manual run on a PR the daemon is
+    // actively working could interleave with a live task.
+    std::fs::create_dir_all(&cfg.inbox_dir)?;
+    let lock_probe = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(cfg.inbox_dir.join("daemon.lock"))?;
+    if matches!(lock_probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)) {
+        println!(
+            "note: a kwkly daemon is running against this inbox — if it has an \
+             active task for this PR, the two runs may interfere"
+        );
+    }
+    drop(lock_probe);
+
+    let ctx = crate::agent::TaskCtx {
+        repo: repo.to_string(),
+        pr_number,
+        pr_title: pr.title.clone(),
+        inbox_dir: cfg.inbox_dir.clone(),
+        claude_bin: cfg.claude_bin.clone(),
+        max_turns: cfg.max_turns,
+        github_token: token,
+        notifications: cfg.notifications,
+        share_build_cache: cfg.share_build_cache,
+        agent_env: cfg.agent_env.clone(),
+        comments: selected,
+    };
+
+    println!("Running agent (this can take a few minutes)…\n");
+    crate::agent::run_task(ctx).await;
+
+    // Consume result.json: the daemon must never reconcile a result it
+    // didn't dispatch (it could otherwise mark a future live run Done early).
+    let task_dir = worktree::task_dir(&cfg.inbox_dir, repo, pr_number);
+    let result_path = task_dir.join("result.json");
+    match std::fs::read_to_string(&result_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<crate::agent::TaskResult>(&raw).ok())
+    {
+        Some(r) => {
+            std::fs::remove_file(&result_path).ok();
+            println!("\n=== run {} ===", if r.ok { "succeeded" } else { "FAILED" });
+            println!("diff produced: {}", if r.has_diff { "yes" } else { "no" });
+            if !r.summary.is_empty() {
+                println!("agent summary: {}", r.summary);
+            }
+        }
+        None => println!("\n=== run finished but wrote no readable result ==="),
+    }
+    println!("\nArtifacts:");
+    println!("  plan:     {}", task_dir.join("PLAN.md").display());
+    println!("  worktree: {}", worktree::worktree_dir(&task_dir).display());
+    println!("  patch:    {}", task_dir.join("changes.patch").display());
+    println!("  log:      {}", task_dir.join("agent-stderr.log").display());
+    Ok(())
+}
+
 // --------------------------------------------------------------- helpers ---
 
 fn show_file(path: &Path, label: &str) {
@@ -298,4 +517,44 @@ fn run_visible(bin: &str, args: &[&str], cwd: &Path) -> Result<bool> {
         println!("({bin} exited with {status})");
     }
     Ok(status.success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_run_target;
+
+    #[test]
+    fn parses_pr_and_comment_urls() {
+        let t = parse_run_target("https://github.com/some-org/some-repo/pull/176").unwrap();
+        assert_eq!((t.repo.as_str(), t.pr), ("some-org/some-repo", 176));
+        assert!(t.comment.is_none());
+
+        let t = parse_run_target(
+            "https://github.com/some-org/some-repo/pull/176#discussion_r1234567890",
+        )
+        .unwrap();
+        let c = t.comment.unwrap();
+        assert_eq!((c.id, c.source), (1234567890, "review_comment"));
+
+        let t = parse_run_target("github.com/a/b/pull/9#issuecomment-77").unwrap();
+        let c = t.comment.unwrap();
+        assert_eq!((t.pr, c.id, c.source), (9, 77, "issue_comment"));
+
+        let t = parse_run_target("https://github.com/a/b/pull/9/files#r123").unwrap();
+        assert_eq!(t.comment.unwrap().source, "review_comment");
+
+        // Trailing path segments and slashes are tolerated
+        assert!(parse_run_target("https://github.com/a/b/pull/9/commits").is_ok());
+        assert!(parse_run_target("https://github.com/a/b/pull/9/").is_ok());
+    }
+
+    #[test]
+    fn rejects_unsupported_urls() {
+        assert!(parse_run_target("https://github.com/a/b/issues/5").is_err());
+        assert!(parse_run_target("https://github.com/a/b").is_err());
+        assert!(parse_run_target("https://gitlab.com/a/b/pull/5").is_err());
+        assert!(parse_run_target("https://github.com/a/b/pull/notanumber").is_err());
+        assert!(parse_run_target("https://github.com/a/b/pull/5#pullrequestreview-1").is_err());
+        assert!(parse_run_target("https://github.com/a/b/pull/5#weird-anchor").is_err());
+    }
 }

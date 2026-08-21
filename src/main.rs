@@ -23,6 +23,11 @@ USAGE:
   kwkly status [config.toml]     list tracked PRs and finished tasks
   kwkly review [config.toml]     walk unreviewed tasks interactively
   kwkly prune  [config.toml]     delete task dirs for merged/closed PRs
+
+  kwkly run <github-pr-or-comment-url> [config.toml]
+      trigger one agent run right now, bypassing polling and debounce.
+      A PR URL handles all outstanding comments; a comment permalink
+      (…#discussion_r… or …#issuecomment-…) handles exactly that comment
 ";
 
 #[tokio::main]
@@ -39,6 +44,15 @@ async fn main() -> Result<()> {
         Some("-h" | "--help" | "help") => {
             print!("{USAGE}");
             return Ok(());
+        }
+        Some("run") => {
+            let Some(url) = args.get(1) else {
+                bail!("usage: kwkly run <github-pr-or-comment-url> [config.toml]");
+            };
+            let target = cli::parse_run_target(url)?;
+            let cfg_path = args.get(2).map(|s| s.as_str()).unwrap_or("config.toml");
+            let cfg = config::Config::load(cfg_path)?;
+            return cli::run_once(&cfg, target).await;
         }
         Some(m @ ("daemon" | "status" | "review" | "prune")) => (m, args.get(1)),
         // Legacy form: bare positional arg is a config path for the daemon.

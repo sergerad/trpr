@@ -23,9 +23,29 @@ pub fn worktree_dir(task_dir: &Path) -> PathBuf {
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    git_with_auth(cwd, args, None).await
+}
+
+/// Network-touching git commands authenticate with the read-only PAT when one
+/// is given, via git's environment-based config (git 2.31+) — never on the
+/// command line (visible in `ps`) and never written to .git/config.
+async fn git_with_auth(
+    cwd: &Path,
+    args: &[&str],
+    token: Option<&str>,
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(cwd);
+    if let Some(token) = token {
+        let header = format!(
+            "Authorization: Basic {}",
+            base64(format!("x-access-token:{token}").as_bytes())
+        );
+        cmd.env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+            .env("GIT_CONFIG_VALUE_0", header);
+    }
+    let out = cmd
         .output()
         .await
         .with_context(|| format!("spawning git {args:?}"))?;
@@ -40,9 +60,27 @@ async fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
     Ok(out)
 }
 
-/// Anonymous https clone — fine for public open-source repos, and it means the
-/// clone itself carries no credentials at all.
-pub async fn ensure_clone(inbox: &Path, repo: &str) -> Result<PathBuf> {
+/// Minimal base64 (standard alphabet, padded) — only used for the git auth
+/// header; not worth a dependency.
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// Clone over https, authenticating with the read-only PAT so private repos
+/// work. The token is passed per-invocation via env — nothing credential-like
+/// lands in the clone's .git/config.
+pub async fn ensure_clone(inbox: &Path, repo: &str, token: &str) -> Result<PathBuf> {
     let clone = clone_dir(inbox, repo);
     if clone.join(".git").exists() {
         return Ok(clone);
@@ -50,7 +88,7 @@ pub async fn ensure_clone(inbox: &Path, repo: &str) -> Result<PathBuf> {
     let parent = clone.parent().context("clone dir has no parent")?.to_path_buf();
     std::fs::create_dir_all(&parent)?;
     let url = format!("https://github.com/{repo}.git");
-    git(&parent, &["clone", &url, "clone"]).await?;
+    git_with_auth(&parent, &["clone", &url, "clone"], Some(token)).await?;
     Ok(clone)
 }
 
@@ -58,16 +96,22 @@ pub async fn ensure_clone(inbox: &Path, repo: &str) -> Result<PathBuf> {
 /// both same-repo and fork PRs. If the worktree already exists (new comments on
 /// a PR we've handled before), it is left as-is so the agent builds on its own
 /// previous, still-unreviewed changes.
-pub async fn prepare_worktree(clone: &Path, task_dir: &Path, pr: u64) -> Result<PathBuf> {
+pub async fn prepare_worktree(
+    clone: &Path,
+    task_dir: &Path,
+    pr: u64,
+    token: &str,
+) -> Result<PathBuf> {
     let wt = worktree_dir(task_dir);
     if wt.exists() {
         return Ok(wt);
     }
     std::fs::create_dir_all(task_dir)?;
     let branch = format!("kwkly/pr-{pr}");
-    git(
+    git_with_auth(
         clone,
         &["fetch", "origin", &format!("+pull/{pr}/head:refs/heads/{branch}")],
+        Some(token),
     )
     .await?;
     let wt_str = wt.to_string_lossy().to_string();

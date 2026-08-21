@@ -66,6 +66,18 @@ cargo install --path .          # installs to ~/.cargo/bin/kwkly
    export KWKLY_GITHUB_TOKEN=github_pat_...
    ```
 
+   **Org-owned / private repos:** a fine-grained PAT is bound to a single
+   *resource owner*. To watch repos in an org, the PAT's resource owner must
+   be **that org** (not your user), with the repos granted — and the org must
+   allow fine-grained PATs (some require admin approval per token). GitHub
+   returns 404, not 403, when a token can't see a private repo. Watching
+   repos across multiple owners currently means one kwkly instance per owner
+   (separate configs + inbox dirs), since there's one token per config.
+
+   kwkly authenticates its own `git clone`/`fetch` with this token too
+   (passed per-invocation via git's env config — never written to
+   `.git/config`), so private repos work end to end.
+
 2. **Config** — `cp config.example.toml config.toml` and set your username
    and repos.
 
@@ -88,7 +100,32 @@ kwkly status     # table of tracked PRs: state, diff ready?, reviewed?
 kwkly review     # walk unreviewed finished tasks one at a time
 kwkly prune      # delete task dirs for PRs that merged/closed (asks first)
 kwkly [daemon]   # the watcher itself
+
+kwkly run <github-pr-or-comment-url>
+                 # trigger one agent run right now
 ```
+
+`kwkly run` triggers a real agent run on demand, immediately and in the
+foreground — no polling, no debounce. Paste a URL straight from GitHub:
+
+```sh
+# whole PR → all outstanding comments
+kwkly run https://github.com/owner/repo/pull/176
+
+# one specific comment → exactly that comment ("Copy link" on the comment)
+kwkly run https://github.com/owner/repo/pull/176#discussion_r3826439452   # inline review comment
+kwkly run https://github.com/owner/repo/pull/176#issuecomment-123456789   # conversation comment
+```
+
+With a plain PR URL, "outstanding" means everything the daemon hasn't already
+seen or queued (every comment on the PR if it isn't tracked yet), bots
+excluded but your own comments included — so commenting on your own PR works.
+A comment permalink runs against exactly that comment, unfiltered; if it
+isn't found, kwkly prints each comment's permalink to pick from. Never writes
+state.json; artifact paths are printed when the run finishes.
+
+It doubles as the end-to-end smoke test for a fresh setup — but note it's not
+a dry run: it consumes real Claude usage like any agent run.
 
 `kwkly review` shows each task's `PLAN.md`, then prompts:
 
