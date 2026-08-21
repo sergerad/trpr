@@ -22,6 +22,7 @@ ENVIRONMENT:
                        Contents/Issues/Pull-requests on the repo
   TRPR_CLAUDE_BIN     Claude Code binary (default: claude)
   TRPR_MAX_TURNS      agent turn cap per run (default: 60)
+  TRPR_DATA_DIR       where run artifacts live (default: ~/.trpr)
 ";
 
 #[tokio::main]

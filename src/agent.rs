@@ -69,7 +69,12 @@ async fn run_inner(
 ) -> Result<(bool, String)> {
     std::fs::create_dir_all(&ctx.run_dir)?;
     let settings_path = ctx.run_dir.join("agent-settings.json");
-    std::fs::write(&settings_path, SETTINGS)?;
+    // The run dir lives outside the checkout (the agent's cwd), so it must
+    // be granted as an additional writable directory for SUMMARY.md.
+    std::fs::write(
+        &settings_path,
+        SETTINGS.replace("{{RUN_DIR}}", &ctx.run_dir.to_string_lossy()),
+    )?;
     let summary_path = ctx.run_dir.join("SUMMARY.md");
 
     let prompt = PROMPT_TEMPLATE

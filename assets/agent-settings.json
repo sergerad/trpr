@@ -1,6 +1,7 @@
 {
   "permissions": {
     "defaultMode": "acceptEdits",
+    "additionalDirectories": ["{{RUN_DIR}}"],
     "allow": [
       "Read",
       "Edit",

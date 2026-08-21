@@ -72,7 +72,7 @@ session. `gh` needs no login — the agent gets the read-only PAT as `GH_TOKEN`.
    ```
 
 Optional env knobs: `TRPR_CLAUDE_BIN` (default `claude`),
-`TRPR_MAX_TURNS` (default 60).
+`TRPR_MAX_TURNS` (default 60), `TRPR_DATA_DIR` (default `~/.trpr`).
 
 ## TUI keys
 
@@ -93,7 +93,11 @@ yours in `git diff`).
 
 ## Run artifacts
 
-Each run writes to `.trpr/runs/<timestamp>/` inside your repo:
+Each run writes to `~/.trpr/runs/<owner>__<repo>/pr-<n>/<timestamp>/`
+(override the base with `TRPR_DATA_DIR`). Nothing is written inside your
+checkout, so there's no gitignore to manage and artifacts survive deleting
+the checkout. Clean up a merged PR's runs with
+`rm -rf ~/.trpr/runs/<owner>__<repo>/pr-<n>`.
 
 | File | What it is |
 |---|---|
@@ -102,9 +106,6 @@ Each run writes to `.trpr/runs/<timestamp>/` inside your repo:
 | `steps.log` | Human-readable step log (same content the TUI streamed) |
 | `transcript.jsonl` | Full raw agent event stream |
 | `stderr.log` | Claude Code's stderr |
-
-`.trpr/` contains a self-ignoring `.gitignore` (`*`), so it's visible in
-your IDE's file tree but never appears in `git status` or your PR diff.
 
 ## What "unresolved comments" means
 

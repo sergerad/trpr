@@ -3,7 +3,7 @@
 
 use crate::agent::{self, RunCtx, RunEvent, Step, StepKind};
 use crate::github::{CommentItem, ItemKind};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -209,7 +209,7 @@ async fn event_loop(
                     Flow::StartRun => {
                         let (tx, rx) = unbounded_channel();
                         let (atx, arx) = unbounded_channel();
-                        let run_dir = prepare_run_dir(&app.repo_root)?;
+                        let run_dir = prepare_run_dir(&app.repo, app.pr_number)?;
                         let ctx = RunCtx {
                             repo_root: app.repo_root.clone(),
                             repo: app.repo.clone(),
@@ -435,20 +435,27 @@ fn log_scroll_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, pending
     }
 }
 
-/// .trpr/runs/<timestamp>, plus the self-ignoring .trpr/.gitignore so the
-/// directory never shows up in git status or the PR diff.
-fn prepare_run_dir(repo_root: &std::path::Path) -> Result<PathBuf> {
-    let trpr = repo_root.join(".trpr");
-    std::fs::create_dir_all(&trpr)?;
-    let gitignore = trpr.join(".gitignore");
-    if !gitignore.exists() {
-        std::fs::write(&gitignore, "*\n")?;
+/// Global data dir: $TRPR_DATA_DIR, or ~/.trpr. Living outside the checkout
+/// means no per-repo gitignore games and artifacts survive checkout deletion.
+fn data_dir() -> Result<PathBuf> {
+    if let Ok(d) = std::env::var("TRPR_DATA_DIR") {
+        return Ok(PathBuf::from(d));
     }
-    let run_dir = trpr
+    let home = std::env::home_dir().context("cannot determine home directory")?;
+    Ok(home.join(".trpr"))
+}
+
+/// <data-dir>/runs/<owner>__<repo>/pr-<n>/<timestamp> — repo dimension is
+/// explicit now that all repos share one tree. Returned absolute, since the
+/// agent needs it as an additional writable directory outside its cwd.
+fn prepare_run_dir(repo: &str, pr_number: u64) -> Result<PathBuf> {
+    let run_dir = data_dir()?
         .join("runs")
+        .join(repo.replace('/', "__"))
+        .join(format!("pr-{pr_number}"))
         .join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string());
     std::fs::create_dir_all(&run_dir)?;
-    Ok(run_dir)
+    Ok(std::fs::canonicalize(&run_dir)?)
 }
 
 fn items_json(items: &[UiItem]) -> String {
