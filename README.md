@@ -26,6 +26,36 @@ changes.patch in ~/agent-inbox ──► desktop notification ──► you revi
 PR comments are untrusted third-party input — treat the layers above as the
 defense, not the agent's good behavior.
 
+## Requirements
+
+kwkly orchestrates existing tools rather than bundling them — these must be
+on `PATH`:
+
+| Dependency | Used for | Check |
+|---|---|---|
+| Rust toolchain **1.89+** | building kwkly (uses std file locking) | `cargo --version` |
+| [Claude Code](https://claude.com/claude-code) CLI | the agent runtime — every task is a headless `claude -p` run | `claude --version` |
+| `git` | clones, per-PR worktrees, patches | `git --version` |
+| `gh` (GitHub CLI) | the *agent* uses it to read PR context (`gh pr view/diff`) | `gh --version` |
+| `notify-send` (Linux only) | desktop notifications — or set `notifications = false` | `notify-send --version` |
+
+Two auth notes:
+
+- **`claude` must be logged in** — run `claude` interactively once and
+  authenticate; headless runs reuse those credentials. Agent runs consume
+  your Claude subscription/API usage like any other Claude Code session.
+- **`gh` does *not* need `gh auth login`** — inside agent runs it
+  authenticates via the read-only PAT that kwkly injects as `GH_TOKEN`.
+
+## Install
+
+```sh
+git clone <this repo> && cd kwkly
+cargo build --release           # binary at target/release/kwkly
+# optional: put it on PATH
+cargo install --path .          # installs to ~/.cargo/bin/kwkly
+```
+
 ## Setup
 
 1. **Token** — create a [fine-grained PAT](https://github.com/settings/personal-access-tokens)
