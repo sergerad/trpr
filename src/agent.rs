@@ -197,7 +197,27 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
     let mut lines = tokio::io::BufReader::new(stdout_pipe).lines();
     let mut ok: Option<bool> = None;
     let mut summary = String::new();
-    while let Some(line) = lines.next_line().await.context("reading agent stream")? {
+    // A long-running tool call (e.g. a cold `cargo check`) emits nothing
+    // until it finishes, which looks like a hang — heartbeat while quiet.
+    let mut last_event = std::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => line.context("reading agent stream")?,
+            _ = heartbeat.tick() => {
+                let quiet = last_event.elapsed().as_secs();
+                if ctx.stream_output && quiet >= 30 {
+                    println!(
+                        "\x1b[2m… agent still working (last output {quiet}s ago — \
+                         long tool calls like builds show nothing until done)\x1b[0m"
+                    );
+                }
+                continue;
+            }
+        };
+        let Some(line) = line else { break };
+        last_event = std::time::Instant::now();
         use std::io::Write as _;
         writeln!(transcript, "{line}")?;
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
