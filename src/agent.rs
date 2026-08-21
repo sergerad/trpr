@@ -23,6 +23,7 @@ pub struct TaskCtx {
     pub max_turns: u32,
     pub github_token: String,
     pub notifications: bool,
+    pub share_build_cache: bool,
     pub agent_env: std::collections::HashMap<String, String>,
     pub comments: Vec<Comment>,
 }
@@ -130,10 +131,18 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
 
-    // User-configured env, with {repo_dir} expanded — the hook for sharing
-    // build caches (CARGO_TARGET_DIR etc.) across a repo's worktrees.
     let repo_root = worktree::repo_root(&ctx.inbox_dir, &ctx.repo);
     let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+
+    // Rust repos: share one target dir across the repo's worktrees instead of
+    // growing a fresh one per PR. Set before agent_env so an explicit
+    // CARGO_TARGET_DIR there wins.
+    if ctx.share_build_cache && wt.join("Cargo.toml").exists() {
+        cmd.env("CARGO_TARGET_DIR", repo_root.join("build-cache"));
+    }
+
+    // User-configured env, with {repo_dir} expanded — the general hook for
+    // build caches in other ecosystems, or anything the repo's tooling needs.
     for (key, value) in &ctx.agent_env {
         cmd.env(key, value.replace("{repo_dir}", &repo_root.to_string_lossy()));
     }

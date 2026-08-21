@@ -105,21 +105,27 @@ clone: they share all git history/objects and only materialize the working
 files of the PR branch. Git data is never duplicated.
 
 What *can* grow per worktree is build output (`target/`, `node_modules`, …)
-if the agent builds or tests. Two ways to keep that down:
+if the agent builds or tests. Three things keep that down:
 
-1. **Share the build cache across worktrees** via `agent_env` in config —
-   `"{repo_dir}"` expands to the repo's inbox directory:
+1. **Rust repos are handled automatically** (`share_build_cache = true`, the
+   default): when a worktree has a root `Cargo.toml`, the agent runs with
+   `CARGO_TARGET_DIR` pointed at `<repo>/build-cache` — one target dir per
+   repo instead of one per worktree. Cargo's own locking handles concurrent
+   builds, and dependency artifacts (the bulk of the size) are reused across
+   PRs. Set `share_build_cache = false` if a repo's tooling assumes
+   `./target` at the conventional path.
+
+2. **Other ecosystems** use the general `agent_env` hook — `"{repo_dir}"`
+   expands to the repo's inbox directory:
 
    ```toml
    [agent_env]
-   CARGO_TARGET_DIR = "{repo_dir}/build-cache"   # Rust: one target dir per repo
+   GOMODCACHE = "{repo_dir}/go-mod-cache"
    ```
 
-   (Cargo handles concurrent builds against a shared target dir with its own
-   locking; dependency artifacts — the bulk of the size — are reused across
-   worktrees and PRs.)
+   An explicit `CARGO_TARGET_DIR` here overrides the automatic one.
 
-2. **`kwkly prune`** deletes finished task dirs — including any per-worktree
+3. **`kwkly prune`** deletes finished task dirs — including any per-worktree
    build output — once their PRs merge or close.
 
 ## Behavior notes

@@ -35,9 +35,14 @@ github_token_env = "KWKLY_GITHUB_TOKEN"
 # macOS: uses osascript (built in). Linux: needs notify-send (libnotify).
 notifications = true
 
+# For Rust repos (Cargo.toml at the worktree root), automatically point
+# CARGO_TARGET_DIR at a shared per-repo build-cache dir so PR worktrees don't
+# each grow their own target/. On by default; set false to disable.
+share_build_cache = true
+
 # Extra env vars for each agent run. "{repo_dir}" expands to the repo's
-# directory under inbox_dir. Main use: share one build cache across all of a
-# repo's PR worktrees instead of duplicating target/ per worktree.
-# For Rust repos:
+# directory under inbox_dir. Use for build caches in other ecosystems (e.g.
+# GOMODCACHE), anything the repo's tooling needs, or to override the
+# CARGO_TARGET_DIR that share_build_cache sets.
 # [agent_env]
-# CARGO_TARGET_DIR = "{repo_dir}/build-cache"
+# GOMODCACHE = "{repo_dir}/go-mod-cache"

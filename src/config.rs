@@ -34,6 +34,11 @@ pub struct Config {
     /// macOS desktop notifications when a task finishes.
     #[serde(default = "d_true")]
     pub notifications: bool,
+    /// For Rust repos (Cargo.toml at the worktree root), point CARGO_TARGET_DIR
+    /// at a shared per-repo build-cache dir so worktrees don't each grow their
+    /// own target/. An explicit CARGO_TARGET_DIR in [agent_env] overrides this.
+    #[serde(default = "d_true")]
+    pub share_build_cache: bool,
     /// Extra env vars for each agent run. "{repo_dir}" in a value expands to
     /// the repo's directory under inbox_dir — e.g. share one cargo target dir
     /// across all of a repo's worktrees:
