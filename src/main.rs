@@ -90,6 +90,12 @@ async fn main() -> Result<()> {
     }
 
     // ---- daemon path ----
+    if cfg.repos.is_empty() {
+        bail!(
+            "no repos configured — add at least one \"owner/name\" to `repos` in {cfg_path} \
+             (the daemon would have nothing to watch)"
+        );
+    }
     let token = cfg.github_token()?;
     std::fs::create_dir_all(&cfg.inbox_dir)?;
 
@@ -253,6 +259,16 @@ async fn poll_repos(cfg: &config::Config, gh: &github::Gh, st: &mut state::State
             }
         }
 
+        info!(
+            "{repo}: {} open PR(s), {} tracked{}",
+            prs.len(),
+            open.len(),
+            if cfg.only_my_prs && open.is_empty() && !prs.is_empty() {
+                " (none authored by you — only_my_prs is on)"
+            } else {
+                ""
+            }
+        );
         st.retain_open(repo, &open);
     }
 }
