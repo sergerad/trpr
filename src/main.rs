@@ -42,10 +42,7 @@ async fn main() -> Result<()> {
          Contents/Issues/Pull-requests permissions on this repo",
     )?;
 
-    eprintln!(
-        "{} on branch {} — looking up PR…",
-        gctx.repo, gctx.branch
-    );
+    eprintln!("{} on branch {} — looking up PR…", gctx.repo, gctx.branch);
     let gh = github::Gh::new(token.clone())?;
     let pr = gh
         .pr_for_branch(&gctx.repo, &gctx.branch)

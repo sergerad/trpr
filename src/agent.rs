@@ -47,7 +47,11 @@ pub struct RunCtx {
 
 /// Entry point for the spawned agent task. Always ends by sending Finished.
 /// `abort_rx` kills the child (user quit / abort from the TUI).
-pub async fn run_agent(ctx: RunCtx, tx: UnboundedSender<RunEvent>, abort_rx: UnboundedReceiver<()>) {
+pub async fn run_agent(
+    ctx: RunCtx,
+    tx: UnboundedSender<RunEvent>,
+    abort_rx: UnboundedReceiver<()>,
+) {
     let result = run_inner(&ctx, &tx, abort_rx).await;
     let _ = tx.send(match result {
         Ok((ok, summary)) => RunEvent::Finished { ok, summary },

@@ -41,10 +41,15 @@ pub struct UiItem {
 pub enum Phase {
     Select,
     /// Editing the instruction for the selected item.
-    Edit { buffer: String },
+    Edit {
+        buffer: String,
+    },
     ConfirmDirty,
     Running,
-    Done { ok: bool, summary: String },
+    Done {
+        ok: bool,
+        summary: String,
+    },
 }
 
 pub struct App {
@@ -91,7 +96,10 @@ impl App {
             dirty,
             items: items
                 .into_iter()
-                .map(|item| UiItem { item, decision: Decision::Pending })
+                .map(|item| UiItem {
+                    item,
+                    decision: Decision::Pending,
+                })
                 .collect(),
             selected: 0,
             focus: Focus::List,
@@ -128,7 +136,10 @@ pub async fn run(mut app: App, actx: AppCtx) -> Result<()> {
     ratatui::restore();
     if let Some(dir) = &app.run_dir {
         println!("Run artifacts: {}", dir.display());
-        println!("Agent changes (if any) are uncommitted in {}", app.repo_root.display());
+        println!(
+            "Agent changes (if any) are uncommitted in {}",
+            app.repo_root.display()
+        );
     }
     result
 }
@@ -285,8 +296,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match app.focus {
                     Focus::List => {
-                        app.selected =
-                            (app.selected + 10).min(app.items.len().saturating_sub(1));
+                        app.selected = (app.selected + 10).min(app.items.len().saturating_sub(1));
                         app.detail_scroll = 0;
                     }
                     Focus::Detail => scroll_detail_down(app, 10),
@@ -298,9 +308,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
                         app.selected = app.selected.saturating_sub(10);
                         app.detail_scroll = 0;
                     }
-                    Focus::Detail => {
-                        app.detail_scroll = app.detail_scroll.saturating_sub(10)
-                    }
+                    Focus::Detail => app.detail_scroll = app.detail_scroll.saturating_sub(10),
                 }
             }
             KeyCode::Char('g') => {
@@ -451,9 +459,11 @@ fn items_json(items: &[UiItem]) -> String {
                 return None;
             };
             let (kind, path, line, outdated) = match &ui.item.kind {
-                ItemKind::Thread { path, line, outdated } => {
-                    ("review_thread", Some(path.clone()), *line, *outdated)
-                }
+                ItemKind::Thread {
+                    path,
+                    line,
+                    outdated,
+                } => ("review_thread", Some(path.clone()), *line, *outdated),
                 ItemKind::Conversation => ("conversation_comment", None, None, false),
             };
             Some(serde_json::json!({
@@ -478,9 +488,12 @@ fn items_json(items: &[UiItem]) -> String {
 // ------------------------------------------------------------------ draw ---
 
 fn draw(f: &mut Frame, app: &App) {
-    let [header, main, footer] =
-        Layout::vertical([Constraint::Length(2), Constraint::Min(3), Constraint::Length(2)])
-            .areas(f.area());
+    let [header, main, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .areas(f.area());
 
     draw_header(f, app, header);
     match &app.phase {
@@ -501,7 +514,10 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(vec![
-        Span::styled("trpr ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "trpr ",
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!(
             "{} PR #{} — {} (branch {})",
             app.repo, app.pr_number, app.pr_title, app.branch
@@ -529,10 +545,7 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
                 Decision::Ignored => ("✗ ", Style::new().fg(Color::DarkGray)),
                 Decision::Instructed(_) => ("✓ ", Style::new().fg(Color::Green)),
             };
-            ListItem::new(Line::styled(
-                format!("{glyph}{}", ui.item.label()),
-                style,
-            ))
+            ListItem::new(Line::styled(format!("{glyph}{}", ui.item.label()), style))
         })
         .collect();
     let focused = Style::new().fg(Color::Cyan);
@@ -543,11 +556,10 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let list = List::new(items)
-        .block(
-            Block::bordered()
-                .border_style(list_border)
-                .title(format!("comments ({} to implement)", app.instructed_count())),
-        )
+        .block(Block::bordered().border_style(list_border).title(format!(
+            "comments ({} to implement)",
+            app.instructed_count()
+        )))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(app.selected.min(app.items.len().saturating_sub(1))));
@@ -580,8 +592,18 @@ fn detail_text(ui: &UiItem) -> Text<'static> {
         Style::new().fg(Color::DarkGray),
     ));
     if let Some(hunk) = &ui.item.diff_hunk {
-        for l in hunk.lines().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-            lines.push(Line::styled(l.to_string(), Style::new().fg(Color::DarkGray)));
+        for l in hunk
+            .lines()
+            .rev()
+            .take(8)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            lines.push(Line::styled(
+                l.to_string(),
+                Style::new().fg(Color::DarkGray),
+            ));
         }
     }
     lines.push(Line::raw(""));
@@ -704,7 +726,8 @@ fn draw_edit_popup(f: &mut Frame, buffer: &str, area: Rect) {
         text.push(Line::raw(""));
     }
     if let Some(last) = text.last_mut() {
-        last.spans.push(Span::styled("█", Style::new().fg(Color::Cyan)));
+        last.spans
+            .push(Span::styled("█", Style::new().fg(Color::Cyan)));
     }
     f.render_widget(
         Paragraph::new(text)

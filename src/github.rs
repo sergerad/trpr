@@ -53,7 +53,11 @@ impl CommentItem {
     /// Short list label, e.g. "src/db/mod.rs:385 @mirko" or "@mirko (conversation)".
     pub fn label(&self) -> String {
         match &self.kind {
-            ItemKind::Thread { path, line, outdated } => format!(
+            ItemKind::Thread {
+                path,
+                line,
+                outdated,
+            } => format!(
                 "{path}{} @{}{}",
                 line.map(|l| format!(":{l}")).unwrap_or_default(),
                 self.author,
@@ -96,7 +100,9 @@ impl Gh {
             let body = resp.text().await.unwrap_or_default();
             bail!("GET {url} -> {status}: {body}");
         }
-        Ok(resp.json::<T>().await.with_context(|| format!("decoding {url}"))?)
+        resp.json::<T>()
+            .await
+            .with_context(|| format!("decoding {url}"))
     }
 
     /// The open PR whose head is `branch`. Tries the indexed head filter
@@ -175,8 +181,13 @@ impl Gh {
             if node["isResolved"].as_bool().unwrap_or(true) {
                 continue;
             }
-            let comments = node["comments"]["nodes"].as_array().cloned().unwrap_or_default();
-            let Some(first) = comments.first() else { continue };
+            let comments = node["comments"]["nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let Some(first) = comments.first() else {
+                continue;
+            };
             let author = first["author"]["login"].as_str().unwrap_or("?").to_string();
             if is_bot(&author, None) {
                 continue;

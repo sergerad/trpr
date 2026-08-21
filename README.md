@@ -117,6 +117,19 @@ your IDE's file tree but never appears in `git status` or your PR diff.
 - Top-level review summary bodies ("Approve"/"Request changes" text) are
   not yet included.
 
+## Development
+
+Tasks are driven by [`just`](https://github.com/casey/just)
+(`brew install just`):
+
+```sh
+just            # fmt-check + clippy (-D warnings) + tests — the CI gate
+just lint       # clippy only
+just fmt        # apply formatting
+just test       # tests only
+just build      # release build
+```
+
 ## Notes
 
 - The PR is found by matching your current branch against open PRs' head
