@@ -315,16 +315,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
     Flow::Continue
 }
 
-/// .kwkly/runs/<timestamp>, plus the self-ignoring .kwkly/.gitignore so the
+/// .trpr/runs/<timestamp>, plus the self-ignoring .trpr/.gitignore so the
 /// directory never shows up in git status or the PR diff.
 fn prepare_run_dir(repo_root: &std::path::Path) -> Result<PathBuf> {
-    let kwkly = repo_root.join(".kwkly");
-    std::fs::create_dir_all(&kwkly)?;
-    let gitignore = kwkly.join(".gitignore");
+    let trpr = repo_root.join(".trpr");
+    std::fs::create_dir_all(&trpr)?;
+    let gitignore = trpr.join(".gitignore");
     if !gitignore.exists() {
         std::fs::write(&gitignore, "*\n")?;
     }
-    let run_dir = kwkly
+    let run_dir = trpr
         .join("runs")
         .join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string());
     std::fs::create_dir_all(&run_dir)?;
@@ -389,7 +389,7 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(vec![
-        Span::styled("kwkly ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled("trpr ", Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw(format!(
             "{} PR #{} — {} (branch {})",
             app.repo, app.pr_number, app.pr_title, app.branch

@@ -41,7 +41,7 @@ pub struct RunCtx {
     pub claude_bin: String,
     pub max_turns: u32,
     pub github_token: String,
-    /// .kwkly/runs/<timestamp> — prompt, settings, transcript, SUMMARY.md.
+    /// .trpr/runs/<timestamp> — prompt, settings, transcript, SUMMARY.md.
     pub run_dir: PathBuf,
 }
 

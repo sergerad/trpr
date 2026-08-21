@@ -71,7 +71,7 @@ fn is_bot(login: &str, kind: Option<&str>) -> bool {
 impl Gh {
     pub fn new(token: String) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent("kwkly")
+            .user_agent("trpr")
             .build()
             .context("building http client")?;
         Ok(Self { http, token })
@@ -152,7 +152,7 @@ impl Gh {
             .http
             .post(format!("{API}/graphql"))
             .bearer_auth(&self.token)
-            .header("User-Agent", "kwkly")
+            .header("User-Agent", "trpr")
             .json(&serde_json::json!({
                 "query": query,
                 "variables": { "owner": owner, "name": name, "number": pr },

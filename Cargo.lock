@@ -626,20 +626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kwkly"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1377,6 +1363,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "trpr"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

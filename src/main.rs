@@ -7,10 +7,10 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
-kwkly — address PR review comments with a Claude Code agent, in your checkout
+trpr — address PR review comments with a Claude Code agent, in your checkout
 
 USAGE:
-  kwkly [path]     open the TUI for the git checkout at path (default: cwd)
+  trpr [path]     open the TUI for the git checkout at path (default: cwd)
 
 The checkout's current branch must have an open PR on github.com (origin).
 The TUI lists the PR's unresolved comments; you attach instructions to the
@@ -18,10 +18,10 @@ ones you want handled and hit go. The agent edits the checkout in place and
 never commits, pushes, or posts to GitHub.
 
 ENVIRONMENT:
-  KWKLY_GITHUB_TOKEN   required — fine-grained PAT with READ-ONLY
+  TRPR_GITHUB_TOKEN   required — fine-grained PAT with READ-ONLY
                        Contents/Issues/Pull-requests on the repo
-  KWKLY_CLAUDE_BIN     Claude Code binary (default: claude)
-  KWKLY_MAX_TURNS      agent turn cap per run (default: 60)
+  TRPR_CLAUDE_BIN     Claude Code binary (default: claude)
+  TRPR_MAX_TURNS      agent turn cap per run (default: 60)
 ";
 
 #[tokio::main]
@@ -37,8 +37,8 @@ async fn main() -> Result<()> {
     };
 
     let gctx = git::discover(&dir)?;
-    let token = std::env::var("KWKLY_GITHUB_TOKEN").context(
-        "KWKLY_GITHUB_TOKEN not set — export a fine-grained PAT with READ-ONLY \
+    let token = std::env::var("TRPR_GITHUB_TOKEN").context(
+        "TRPR_GITHUB_TOKEN not set — export a fine-grained PAT with READ-ONLY \
          Contents/Issues/Pull-requests permissions on this repo",
     )?;
 
@@ -77,8 +77,8 @@ async fn main() -> Result<()> {
     );
     let actx = tui::AppCtx {
         token,
-        claude_bin: std::env::var("KWKLY_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
-        max_turns: std::env::var("KWKLY_MAX_TURNS")
+        claude_bin: std::env::var("TRPR_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string()),
+        max_turns: std::env::var("TRPR_MAX_TURNS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(60),

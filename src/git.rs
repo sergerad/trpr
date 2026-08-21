@@ -40,7 +40,7 @@ pub fn discover(dir: &Path) -> Result<GitCtx> {
         bail!("detached HEAD — check out the PR branch first");
     }
     let url = git(&root, &["remote", "get-url", "origin"])
-        .context("no 'origin' remote — kwkly needs one pointing at github.com")?;
+        .context("no 'origin' remote — trpr needs one pointing at github.com")?;
     let repo = parse_github_remote(&url)
         .with_context(|| format!("origin remote '{url}' is not a github.com repo"))?;
     let dirty = !git(&root, &["status", "--porcelain"])?.is_empty();

@@ -1,14 +1,14 @@
-# kwkly
+# trpr - Triage Pull-Request
 
 Address PR review comments with a [Claude Code](https://claude.com/claude-code)
 agent — from inside your checkout, on your terms.
 
 ```sh
 cd ~/Source/miden-node        # your checkout, on the PR branch
-kwkly                         # or: kwkly ~/Source/miden-node
+trpr                         # or: trpr ~/Source/miden-node
 ```
 
-kwkly figures out which GitHub repo and PR your current branch belongs to,
+trpr figures out which GitHub repo and PR your current branch belongs to,
 fetches the PR's **unresolved comments**, and opens a TUI:
 
 1. **Select** — browse the comments (inline review threads + conversation-tab
@@ -21,7 +21,7 @@ fetches the PR's **unresolved comments**, and opens a TUI:
    the agent's thinking, tool calls, and output live.
 4. **Review in your IDE** — when it's done, the changes are ordinary
    uncommitted edits in your working tree. `git diff`, tweak, commit, push —
-   all yours. kwkly never commits, never pushes, never posts to GitHub.
+   all yours. trpr never commits, never pushes, never posts to GitHub.
 
 ## Safety model
 
@@ -44,7 +44,7 @@ discipline as reviewing any contributor's PR.
 
 | Dependency | Used for | Check |
 |---|---|---|
-| Rust toolchain | building kwkly | `cargo --version` |
+| Rust toolchain | building trpr | `cargo --version` |
 | [Claude Code](https://claude.com/claude-code) CLI, logged in | the agent runtime | `claude --version` |
 | `git` | repo/branch discovery, dirty check | `git --version` |
 | `gh` (GitHub CLI) | the *agent* uses it to read PR context | `gh --version` |
@@ -62,17 +62,17 @@ session. `gh` needs no login — the agent gets the read-only PAT as `GH_TOKEN`.
    token can't see a private repo.
 
    ```sh
-   export KWKLY_GITHUB_TOKEN=github_pat_...
+   export TRPR_GITHUB_TOKEN=github_pat_...
    ```
 
 2. Build and install:
 
    ```sh
-   cargo install --path .        # installs ~/.cargo/bin/kwkly
+   cargo install --path .        # installs ~/.cargo/bin/trpr
    ```
 
-Optional env knobs: `KWKLY_CLAUDE_BIN` (default `claude`),
-`KWKLY_MAX_TURNS` (default 60).
+Optional env knobs: `TRPR_CLAUDE_BIN` (default `claude`),
+`TRPR_MAX_TURNS` (default 60).
 
 ## TUI keys
 
@@ -83,13 +83,13 @@ Optional env knobs: `KWKLY_CLAUDE_BIN` (default `claude`),
 | Running | `q` abort (kills the agent) · `↑`/`↓`/PgUp/PgDn scroll |
 | Done | `q` quit · scroll as above |
 
-If your working tree has uncommitted changes, kwkly warns in the header and
+If your working tree has uncommitted changes, trpr warns in the header and
 asks for confirmation before starting a run (agent edits would mix with
 yours in `git diff`).
 
 ## Run artifacts
 
-Each run writes to `.kwkly/runs/<timestamp>/` inside your repo:
+Each run writes to `.trpr/runs/<timestamp>/` inside your repo:
 
 | File | What it is |
 |---|---|
@@ -99,7 +99,7 @@ Each run writes to `.kwkly/runs/<timestamp>/` inside your repo:
 | `transcript.jsonl` | Full raw agent event stream |
 | `stderr.log` | Claude Code's stderr |
 
-`.kwkly/` contains a self-ignoring `.gitignore` (`*`), so it's visible in
+`.trpr/` contains a self-ignoring `.gitignore` (`*`), so it's visible in
 your IDE's file tree but never appears in `git status` or your PR diff.
 
 ## What "unresolved comments" means
@@ -117,6 +117,6 @@ your IDE's file tree but never appears in `git status` or your PR diff.
 
 - The PR is found by matching your current branch against open PRs' head
   branches (works for same-repo and fork-headed PRs). No open PR → error.
-- kwkly holds no state between invocations: every launch re-fetches the
+- trpr holds no state between invocations: every launch re-fetches the
   PR's comments fresh. Resolve handled threads on GitHub (or re-`x` them)
   to keep the list short.
