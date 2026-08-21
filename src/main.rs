@@ -255,6 +255,7 @@ fn dispatch_ready(
                 max_turns: cfg.max_turns,
                 github_token: token.to_string(),
                 notifications: cfg.notifications,
+                agent_env: cfg.agent_env.clone(),
                 comments: std::mem::take(&mut pr.pending_comments),
             };
             pr.status = TaskStatus::Running;

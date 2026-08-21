@@ -34,3 +34,10 @@ github_token_env = "KWKLY_GITHUB_TOKEN"
 # Desktop notifications when a task finishes.
 # macOS: uses osascript (built in). Linux: needs notify-send (libnotify).
 notifications = true
+
+# Extra env vars for each agent run. "{repo_dir}" expands to the repo's
+# directory under inbox_dir. Main use: share one build cache across all of a
+# repo's PR worktrees instead of duplicating target/ per worktree.
+# For Rust repos:
+# [agent_env]
+# CARGO_TARGET_DIR = "{repo_dir}/build-cache"

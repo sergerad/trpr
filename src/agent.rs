@@ -23,6 +23,7 @@ pub struct TaskCtx {
     pub max_turns: u32,
     pub github_token: String,
     pub notifications: bool,
+    pub agent_env: std::collections::HashMap<String, String>,
     pub comments: Vec<Comment>,
 }
 
@@ -110,24 +111,34 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
         comments.len()
     );
 
-    let mut child = tokio::process::Command::new(&ctx.claude_bin)
-        .args([
-            "-p",
-            "--output-format",
-            "json",
-            "--max-turns",
-            &ctx.max_turns.to_string(),
-            "--settings",
-            &settings_path.to_string_lossy(),
-        ])
-        .current_dir(&wt)
-        // The read-only PAT is the only GitHub credential the agent sees —
-        // `gh` inside the sandbox physically cannot write to GitHub.
-        .env("GH_TOKEN", &ctx.github_token)
-        .env("GITHUB_TOKEN", &ctx.github_token)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut cmd = tokio::process::Command::new(&ctx.claude_bin);
+    cmd.args([
+        "-p",
+        "--output-format",
+        "json",
+        "--max-turns",
+        &ctx.max_turns.to_string(),
+        "--settings",
+        &settings_path.to_string_lossy(),
+    ])
+    .current_dir(&wt)
+    // The read-only PAT is the only GitHub credential the agent sees —
+    // `gh` inside the sandbox physically cannot write to GitHub.
+    .env("GH_TOKEN", &ctx.github_token)
+    .env("GITHUB_TOKEN", &ctx.github_token)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    // User-configured env, with {repo_dir} expanded — the hook for sharing
+    // build caches (CARGO_TARGET_DIR etc.) across a repo's worktrees.
+    let repo_root = worktree::repo_root(&ctx.inbox_dir, &ctx.repo);
+    let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
+    for (key, value) in &ctx.agent_env {
+        cmd.env(key, value.replace("{repo_dir}", &repo_root.to_string_lossy()));
+    }
+
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {}", ctx.claude_bin))?;
 

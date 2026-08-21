@@ -34,6 +34,13 @@ pub struct Config {
     /// macOS desktop notifications when a task finishes.
     #[serde(default = "d_true")]
     pub notifications: bool,
+    /// Extra env vars for each agent run. "{repo_dir}" in a value expands to
+    /// the repo's directory under inbox_dir — e.g. share one cargo target dir
+    /// across all of a repo's worktrees:
+    ///   [agent_env]
+    ///   CARGO_TARGET_DIR = "{repo_dir}/build-cache"
+    #[serde(default)]
+    pub agent_env: std::collections::HashMap<String, String>,
 }
 
 fn d_inbox() -> PathBuf {

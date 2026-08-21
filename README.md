@@ -97,6 +97,31 @@ When a PR is merged/closed its state entry is dropped automatically; the
 on-disk task dir stays until you run `kwkly prune` (which confirms before
 deleting anything, including unreviewed changes).
 
+## Disk usage: what's shared, what isn't
+
+Per repo there is exactly **one clone** (`<inbox>/<owner>__<repo>/clone/`) —
+the single git object store. Per-PR checkouts are **git worktrees** of that
+clone: they share all git history/objects and only materialize the working
+files of the PR branch. Git data is never duplicated.
+
+What *can* grow per worktree is build output (`target/`, `node_modules`, …)
+if the agent builds or tests. Two ways to keep that down:
+
+1. **Share the build cache across worktrees** via `agent_env` in config —
+   `"{repo_dir}"` expands to the repo's inbox directory:
+
+   ```toml
+   [agent_env]
+   CARGO_TARGET_DIR = "{repo_dir}/build-cache"   # Rust: one target dir per repo
+   ```
+
+   (Cargo handles concurrent builds against a shared target dir with its own
+   locking; dependency artifacts — the bulk of the size — are reused across
+   worktrees and PRs.)
+
+2. **`kwkly prune`** deletes finished task dirs — including any per-worktree
+   build output — once their PRs merge or close.
+
 ## Behavior notes
 
 - **First sighting of a PR is baselined** — old comment history isn't replayed;
