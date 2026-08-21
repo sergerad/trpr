@@ -2,11 +2,12 @@
 
 # Your GitHub login. Used to skip your own comments, and (with only_my_prs)
 # to watch only PRs you authored.
-username = "sergeradinovich"
+username = "sergerad"
 
 # Repositories to watch, "owner/name".
 repos = [
   # "rust-lang/rust",
+  "0xMiden/miden-node"
 ]
 
 # Where clones, worktrees, and review artifacts land.

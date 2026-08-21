@@ -1,171 +1,101 @@
-use crate::github::Comment;
-use crate::{notify, worktree};
+//! Spawns a headless Claude Code run in the developer's checkout and streams
+//! its activity back as rendered steps.
+
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tracing::{error, info};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 const PROMPT_TEMPLATE: &str = include_str!("../assets/prompt.md");
-const SETTINGS_TEMPLATE: &str = include_str!("../assets/agent-settings.json");
+const SETTINGS: &str = include_str!("../assets/agent-settings.json");
 
-/// Everything a spawned task needs — cloned out of config/state so the task
-/// owns its data and never touches shared state. Completion is communicated
-/// back to the main loop via result.json in the task dir.
-#[derive(Debug, Clone)]
-pub struct TaskCtx {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StepKind {
+    Meta,
+    Thinking,
+    Text,
+    ToolUse,
+    ToolResult,
+}
+
+#[derive(Clone, Debug)]
+pub struct Step {
+    pub kind: StepKind,
+    pub text: String,
+}
+
+pub enum RunEvent {
+    Step(Step),
+    Finished { ok: bool, summary: String },
+}
+
+pub struct RunCtx {
+    pub repo_root: PathBuf,
     pub repo: String,
     pub pr_number: u64,
     pub pr_title: String,
-    pub inbox_dir: PathBuf,
+    pub branch: String,
+    /// JSON array of the selected comments plus the developer's instructions.
+    pub items_json: String,
     pub claude_bin: String,
     pub max_turns: u32,
     pub github_token: String,
-    pub notifications: bool,
-    /// Print the agent's steps (thinking, tool calls, text) live to stdout.
-    /// On for foreground `kwkly run`; off for daemon tasks (which may run
-    /// several agents concurrently — their transcripts go to files instead).
-    pub stream_output: bool,
-    pub share_build_cache: bool,
-    pub agent_env: std::collections::HashMap<String, String>,
-    pub comments: Vec<Comment>,
+    /// .kwkly/runs/<timestamp> — prompt, settings, transcript, SUMMARY.md.
+    pub run_dir: PathBuf,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TaskResult {
-    pub ok: bool,
-    pub has_diff: bool,
-    pub summary: String,
-    pub finished_at: chrono::DateTime<chrono::Utc>,
+/// Entry point for the spawned agent task. Always ends by sending Finished.
+/// `abort_rx` kills the child (user quit / abort from the TUI).
+pub async fn run_agent(ctx: RunCtx, tx: UnboundedSender<RunEvent>, abort_rx: UnboundedReceiver<()>) {
+    let result = run_inner(&ctx, &tx, abort_rx).await;
+    let _ = tx.send(match result {
+        Ok((ok, summary)) => RunEvent::Finished { ok, summary },
+        Err(e) => RunEvent::Finished {
+            ok: false,
+            summary: format!("{e:#}"),
+        },
+    });
 }
 
-/// Entry point for a spawned task. Always writes result.json (success or
-/// failure) so the reconcile pass in the main loop can move the PR out of
-/// Running, then fires a desktop notification.
-pub async fn run_task(ctx: TaskCtx) {
-    let task_dir = worktree::task_dir(&ctx.inbox_dir, &ctx.repo, ctx.pr_number);
-
-    if ctx.notifications {
-        let title = format!("kwkly: {} #{}", ctx.repo, ctx.pr_number);
-        // Empty comments = crash-recovered task re-running from comments.json.
-        let msg = if ctx.comments.is_empty() {
-            "Agent started (resuming recovered task)".to_string()
-        } else {
-            format!("Agent started on {} new comment(s)", ctx.comments.len())
-        };
-        notify::notify(&title, &msg).await;
-    }
-
-    let result = match run_inner(&ctx, &task_dir).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("{} PR #{}: task failed: {e:#}", ctx.repo, ctx.pr_number);
-            TaskResult {
-                ok: false,
-                has_diff: false,
-                summary: format!("{e:#}"),
-                finished_at: chrono::Utc::now(),
-            }
-        }
-    };
-
-    if let Err(e) = write_result(&task_dir, &result) {
-        error!("{} PR #{}: writing result.json failed: {e:#}", ctx.repo, ctx.pr_number);
-    }
-
-    if ctx.notifications {
-        let title = format!("kwkly: {} #{}", ctx.repo, ctx.pr_number);
-        let msg = if !result.ok {
-            "Task FAILED — see agent-stderr.log".to_string()
-        } else if result.has_diff {
-            "Diff ready for review".to_string()
-        } else {
-            "Done — no code changes (see PLAN.md)".to_string()
-        };
-        notify::notify(&title, &msg).await;
-    }
-}
-
-async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
-    std::fs::create_dir_all(task_dir)?;
-
-    // Persist the comment batch before doing anything else: it's both the
-    // agent's input of record and the crash-recovery source (a task restarted
-    // after a daemon crash arrives with ctx.comments empty and reads this file).
-    let comments_path = task_dir.join("comments.json");
-    let comments: Vec<Comment> = if ctx.comments.is_empty() {
-        let raw = std::fs::read_to_string(&comments_path)
-            .context("recovering task with no comments.json on disk")?;
-        serde_json::from_str(&raw)?
-    } else {
-        std::fs::write(&comments_path, serde_json::to_string_pretty(&ctx.comments)?)?;
-        ctx.comments.clone()
-    };
-
-    let clone = worktree::ensure_clone(&ctx.inbox_dir, &ctx.repo, &ctx.github_token).await?;
-    let wt =
-        worktree::prepare_worktree(&clone, task_dir, ctx.pr_number, &ctx.github_token).await?;
-    let task_dir_abs = std::fs::canonicalize(task_dir)?;
-
-    // Per-task settings: the static template plus this task's absolute dir as
-    // an additional writable directory (for PLAN.md / REPLY-DRAFT.md).
-    let settings_path = task_dir.join("agent-settings.json");
-    let settings =
-        SETTINGS_TEMPLATE.replace("{{TASK_DIR}}", &task_dir_abs.to_string_lossy());
-    std::fs::write(&settings_path, settings)?;
+async fn run_inner(
+    ctx: &RunCtx,
+    tx: &UnboundedSender<RunEvent>,
+    mut abort_rx: UnboundedReceiver<()>,
+) -> Result<(bool, String)> {
+    std::fs::create_dir_all(&ctx.run_dir)?;
+    let settings_path = ctx.run_dir.join("agent-settings.json");
+    std::fs::write(&settings_path, SETTINGS)?;
+    let summary_path = ctx.run_dir.join("SUMMARY.md");
 
     let prompt = PROMPT_TEMPLATE
         .replace("{{REPO}}", &ctx.repo)
         .replace("{{PR_NUMBER}}", &ctx.pr_number.to_string())
         .replace("{{PR_TITLE}}", &ctx.pr_title)
-        .replace("{{TASK_DIR}}", &task_dir_abs.to_string_lossy())
-        .replace("{{COMMENTS_JSON}}", &serde_json::to_string_pretty(&comments)?);
+        .replace("{{BRANCH}}", &ctx.branch)
+        .replace("{{SUMMARY_PATH}}", &summary_path.to_string_lossy())
+        .replace("{{ITEMS_JSON}}", &ctx.items_json);
+    std::fs::write(ctx.run_dir.join("prompt.md"), &prompt)?;
 
-    info!(
-        "{} PR #{}: launching agent on {} comment(s)",
-        ctx.repo,
-        ctx.pr_number,
-        comments.len()
-    );
-
-    let mut cmd = tokio::process::Command::new(&ctx.claude_bin);
-    cmd.args([
-        "-p",
-        "--output-format",
-        "stream-json", // JSONL event stream; --verbose is required with it in print mode
-        "--verbose",
-        "--max-turns",
-        &ctx.max_turns.to_string(),
-        "--settings",
-        &settings_path.to_string_lossy(),
-    ])
-    .current_dir(&wt)
-    // The read-only PAT is the only GitHub credential the agent sees —
-    // `gh` inside the sandbox physically cannot write to GitHub.
-    .env("GH_TOKEN", &ctx.github_token)
-    .env("GITHUB_TOKEN", &ctx.github_token)
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
-
-    let repo_root = worktree::repo_root(&ctx.inbox_dir, &ctx.repo);
-    let repo_root = std::fs::canonicalize(&repo_root).unwrap_or(repo_root);
-
-    // Rust repos: share one target dir across the repo's worktrees instead of
-    // growing a fresh one per PR. Set before agent_env so an explicit
-    // CARGO_TARGET_DIR there wins.
-    if ctx.share_build_cache && wt.join("Cargo.toml").exists() {
-        cmd.env("CARGO_TARGET_DIR", repo_root.join("build-cache"));
-    }
-
-    // User-configured env, with {repo_dir} expanded — the general hook for
-    // build caches in other ecosystems, or anything the repo's tooling needs.
-    for (key, value) in &ctx.agent_env {
-        cmd.env(key, value.replace("{repo_dir}", &repo_root.to_string_lossy()));
-    }
-
-    let mut child = cmd
+    let mut child = tokio::process::Command::new(&ctx.claude_bin)
+        .args([
+            "-p",
+            "--output-format",
+            "stream-json", // JSONL event stream; --verbose required with it in print mode
+            "--verbose",
+            "--max-turns",
+            &ctx.max_turns.to_string(),
+            "--settings",
+            &settings_path.to_string_lossy(),
+        ])
+        .current_dir(&ctx.repo_root)
+        // The read-only PAT is the only GitHub credential the agent sees —
+        // `gh` inside the run cannot write to GitHub.
+        .env("GH_TOKEN", &ctx.github_token)
+        .env("GITHUB_TOKEN", &ctx.github_token)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning {}", ctx.claude_bin))?;
 
@@ -186,38 +116,24 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
         buf
     });
 
-    // Stream events line by line. Every raw line goes to the transcript file
-    // (agent-output.jsonl); rendered human-readable steps go to
-    // agent-steps.log — both written live, so a daemon task can be watched
-    // with `tail -f`. With stream_output on, steps also print to stdout
-    // (styled). The final "result" event carries success + summary.
     let stdout_pipe = child.stdout.take().context("child stdout unavailable")?;
-    let mut transcript = std::fs::File::create(task_dir.join("agent-output.jsonl"))?;
-    let mut steps_log = std::fs::File::create(task_dir.join("agent-steps.log"))?;
+    let mut transcript = std::fs::File::create(ctx.run_dir.join("transcript.jsonl"))?;
+    let mut steps_log = std::fs::File::create(ctx.run_dir.join("steps.log"))?;
     let mut lines = tokio::io::BufReader::new(stdout_pipe).lines();
     let mut ok: Option<bool> = None;
     let mut summary = String::new();
-    // A long-running tool call (e.g. a cold `cargo check`) emits nothing
-    // until it finishes, which looks like a hang — heartbeat while quiet.
-    let mut last_event = std::time::Instant::now();
-    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut aborted = false;
+
     loop {
         let line = tokio::select! {
             line = lines.next_line() => line.context("reading agent stream")?,
-            _ = heartbeat.tick() => {
-                let quiet = last_event.elapsed().as_secs();
-                if ctx.stream_output && quiet >= 30 {
-                    println!(
-                        "\x1b[2m… agent still working (last output {quiet}s ago — \
-                         long tool calls like builds show nothing until done)\x1b[0m"
-                    );
-                }
-                continue;
+            _ = abort_rx.recv() => {
+                aborted = true;
+                let _ = child.kill().await;
+                break;
             }
         };
         let Some(line) = line else { break };
-        last_event = std::time::Instant::now();
         use std::io::Write as _;
         writeln!(transcript, "{line}")?;
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -225,61 +141,32 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
         };
         if event["type"].as_str() == Some("result") {
             ok = Some(!event["is_error"].as_bool().unwrap_or(false));
-            summary = truncate(event["result"].as_str().unwrap_or(""), 500);
-            writeln!(steps_log, "── result: {}", if ok == Some(true) { "ok" } else { "ERROR" })?;
+            summary = truncate(event["result"].as_str().unwrap_or(""), 2000);
+            writeln!(
+                steps_log,
+                "── result: {}",
+                if ok == Some(true) { "ok" } else { "ERROR" }
+            )?;
         } else {
             for step in render_event(&event) {
                 writeln!(steps_log, "{}", step.text)?;
-                if ctx.stream_output {
-                    println!("{}", step.styled());
-                }
+                let _ = tx.send(RunEvent::Step(step));
             }
         }
     }
 
     let status = child.wait().await.context("waiting for claude")?;
     let stderr_buf = stderr_task.await.unwrap_or_default();
-    std::fs::write(task_dir.join("agent-stderr.log"), &stderr_buf)?;
+    std::fs::write(ctx.run_dir.join("stderr.log"), &stderr_buf)?;
 
+    if aborted {
+        return Ok((false, "aborted by user".to_string()));
+    }
     let ok = ok.unwrap_or_else(|| status.success());
     if summary.is_empty() && !ok {
-        summary = "agent exited abnormally — see agent-stderr.log".to_string();
+        summary = "agent exited abnormally — see stderr.log in the run dir".to_string();
     }
-    let has_diff = worktree::write_patch(&wt, &task_dir.join("changes.patch")).await?;
-
-    Ok(TaskResult {
-        ok,
-        has_diff,
-        summary,
-        finished_at: chrono::Utc::now(),
-    })
-}
-
-/// One rendered line of agent activity. `text` is plain (what the step log
-/// gets); `styled()` adds terminal colors for live stdout streaming.
-struct Step {
-    kind: StepKind,
-    text: String,
-}
-
-enum StepKind {
-    Meta,
-    Thinking,
-    Text,
-    ToolUse,
-    ToolResult,
-}
-
-impl Step {
-    fn styled(&self) -> String {
-        match self.kind {
-            StepKind::Thinking | StepKind::ToolResult | StepKind::Meta => {
-                format!("\x1b[2m{}\x1b[0m", self.text) // dim
-            }
-            StepKind::ToolUse => format!("\x1b[1m{}\x1b[0m", self.text), // bold
-            StepKind::Text => self.text.clone(),
-        }
-    }
+    Ok((ok, summary))
 }
 
 /// Human-readable rendering of one stream-json event, mirroring the shape of
@@ -366,7 +253,7 @@ fn tool_result_text(block: &serde_json::Value) -> String {
 }
 
 /// Char-boundary-safe truncation with an ellipsis.
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -374,12 +261,4 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
-}
-
-fn write_result(task_dir: &Path, result: &TaskResult) -> Result<()> {
-    std::fs::create_dir_all(task_dir)?;
-    let tmp = task_dir.join("result.json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(result)?)?;
-    std::fs::rename(&tmp, task_dir.join("result.json"))?;
-    Ok(())
 }

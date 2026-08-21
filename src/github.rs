@@ -1,20 +1,14 @@
+//! GitHub API client: find the PR for a branch, fetch its unresolved
+//! comments. Read-only; authenticated with the read-only PAT.
+
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use tracing::warn;
+use serde::Deserialize;
 
 const API: &str = "https://api.github.com";
 
 pub struct Gh {
     http: reqwest::Client,
     token: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct User {
-    pub login: String,
-    #[serde(rename = "type", default)]
-    pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -27,28 +21,51 @@ pub struct PrHead {
 pub struct Pr {
     pub number: u64,
     pub title: String,
-    pub user: User,
     pub head: PrHead,
+    pub html_url: String,
 }
 
-/// One PR comment, from either the issue-comment or review-comment API.
-/// Serialized into comments.json and embedded in the agent prompt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Comment {
-    pub id: u64,
-    pub user: User,
+/// One reviewable item shown in the TUI: an unresolved inline review thread,
+/// or a conversation-tab comment.
+#[derive(Debug, Clone)]
+pub struct CommentItem {
+    pub kind: ItemKind,
+    pub author: String,
+    /// The thread's first (or the conversation comment's only) body.
     pub body: String,
-    pub created_at: DateTime<Utc>,
-    pub html_url: String,
-    /// Review comments only: the file the comment is anchored to.
-    #[serde(default)]
-    pub path: Option<String>,
-    /// Review comments only: the diff context the reviewer saw.
-    #[serde(default)]
+    /// Follow-up comments in the thread: (author, body).
+    pub replies: Vec<(String, String)>,
     pub diff_hunk: Option<String>,
-    /// "issue_comment" (PR conversation tab) or "review_comment" (inline on the diff).
-    #[serde(default)]
-    pub source: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ItemKind {
+    Thread {
+        path: String,
+        line: Option<u64>,
+        outdated: bool,
+    },
+    Conversation,
+}
+
+impl CommentItem {
+    /// Short list label, e.g. "src/db/mod.rs:385 @mirko" or "@mirko (conversation)".
+    pub fn label(&self) -> String {
+        match &self.kind {
+            ItemKind::Thread { path, line, outdated } => format!(
+                "{path}{} @{}{}",
+                line.map(|l| format!(":{l}")).unwrap_or_default(),
+                self.author,
+                if *outdated { " (outdated)" } else { "" }
+            ),
+            ItemKind::Conversation => format!("@{} (conversation)", self.author),
+        }
+    }
+}
+
+fn is_bot(login: &str, kind: Option<&str>) -> bool {
+    login.ends_with("[bot]") || kind == Some("Bot")
 }
 
 impl Gh {
@@ -82,82 +99,139 @@ impl Gh {
         Ok(resp.json::<T>().await.with_context(|| format!("decoding {url}"))?)
     }
 
-    pub async fn pr(&self, repo: &str, number: u64) -> Result<Pr> {
-        self.get_json(&format!("{API}/repos/{repo}/pulls/{number}")).await
+    /// The open PR whose head is `branch`. Tries the indexed head filter
+    /// first, then falls back to scanning open PRs (covers fork-headed PRs).
+    pub async fn pr_for_branch(&self, repo: &str, branch: &str) -> Result<Option<Pr>> {
+        let owner = repo.split('/').next().unwrap_or("");
+        let url = format!("{API}/repos/{repo}/pulls?state=open&head={owner}:{branch}");
+        let prs: Vec<Pr> = self.get_json(&url).await.with_context(|| {
+            format!(
+                "listing PRs for {repo} — a 404 usually means the token can't see the \
+                 repo (private repo: the fine-grained PAT needs '{owner}' as resource \
+                 owner with this repo granted)"
+            )
+        })?;
+        if let Some(pr) = prs.into_iter().next() {
+            return Ok(Some(pr));
+        }
+        let prs: Vec<Pr> = self
+            .get_json(&format!("{API}/repos/{repo}/pulls?state=open&per_page=100"))
+            .await?;
+        Ok(prs.into_iter().find(|p| p.head.branch == branch))
     }
 
-    /// Who the token authenticates as (fine-grained PATs act as their user
-    /// regardless of resource owner).
-    pub async fn whoami(&self) -> Result<String> {
-        let v: serde_json::Value = self.get_json(&format!("{API}/user")).await?;
-        Ok(v["login"].as_str().unwrap_or("?").to_string())
+    /// Unresolved inline review threads (GraphQL — REST doesn't expose
+    /// resolved state) plus all conversation-tab comments. Bots excluded.
+    pub async fn unresolved_items(&self, repo: &str, pr: u64) -> Result<Vec<CommentItem>> {
+        let mut items = self.unresolved_threads(repo, pr).await?;
+        items.extend(self.conversation_comments(repo, pr).await?);
+        Ok(items)
     }
 
-    /// Whether the token can see a repo: Some(is_private) if visible, None on
-    /// GitHub's 404 (which it returns for both "no access" and "no such repo").
-    pub async fn repo_meta(&self, repo: &str) -> Result<Option<bool>> {
+    async fn unresolved_threads(&self, repo: &str, pr: u64) -> Result<Vec<CommentItem>> {
+        let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
+        let query = r#"
+            query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  reviewThreads(first: 100) {
+                    nodes {
+                      isResolved
+                      isOutdated
+                      path
+                      line
+                      comments(first: 50) {
+                        nodes { author { login } body url diffHunk }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#;
         let resp = self
-            .req(&format!("{API}/repos/{repo}"))
+            .http
+            .post(format!("{API}/graphql"))
+            .bearer_auth(&self.token)
+            .header("User-Agent", "kwkly")
+            .json(&serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "name": name, "number": pr },
+            }))
             .send()
             .await
-            .with_context(|| format!("GET /repos/{repo}"))?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
+            .context("POST /graphql")?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await.context("decoding graphql response")?;
+        if !status.is_success() || v["errors"].is_array() {
+            bail!("graphql query failed ({status}): {}", v["errors"]);
         }
-        if !resp.status().is_success() {
-            bail!("GET /repos/{repo} -> {}", resp.status());
+
+        let mut out = Vec::new();
+        let nodes = v["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for node in nodes {
+            if node["isResolved"].as_bool().unwrap_or(true) {
+                continue;
+            }
+            let comments = node["comments"]["nodes"].as_array().cloned().unwrap_or_default();
+            let Some(first) = comments.first() else { continue };
+            let author = first["author"]["login"].as_str().unwrap_or("?").to_string();
+            if is_bot(&author, None) {
+                continue;
+            }
+            let replies = comments[1..]
+                .iter()
+                .map(|c| {
+                    (
+                        c["author"]["login"].as_str().unwrap_or("?").to_string(),
+                        c["body"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect();
+            out.push(CommentItem {
+                kind: ItemKind::Thread {
+                    path: node["path"].as_str().unwrap_or("?").to_string(),
+                    line: node["line"].as_u64(),
+                    outdated: node["isOutdated"].as_bool().unwrap_or(false),
+                },
+                author,
+                body: first["body"].as_str().unwrap_or("").to_string(),
+                replies,
+                diff_hunk: first["diffHunk"].as_str().map(|s| s.to_string()),
+                url: first["url"].as_str().unwrap_or("").to_string(),
+            });
         }
-        let v: serde_json::Value = resp.json().await?;
-        Ok(Some(v["private"].as_bool().unwrap_or(false)))
+        Ok(out)
     }
 
-    pub async fn open_prs(&self, repo: &str) -> Result<Vec<Pr>> {
-        let url = format!("{API}/repos/{repo}/pulls?state=open&per_page=100");
-        let prs: Vec<Pr> = self.get_json(&url).await?;
-        if prs.len() == 100 {
-            warn!("{repo}: 100+ open PRs; pagination not implemented, later pages ignored");
+    async fn conversation_comments(&self, repo: &str, pr: u64) -> Result<Vec<CommentItem>> {
+        #[derive(Deserialize)]
+        struct User {
+            login: String,
+            #[serde(rename = "type", default)]
+            kind: Option<String>,
         }
-        Ok(prs)
+        #[derive(Deserialize)]
+        struct IssueComment {
+            user: User,
+            body: String,
+            html_url: String,
+        }
+        let url = format!("{API}/repos/{repo}/issues/{pr}/comments?per_page=100");
+        let comments: Vec<IssueComment> = self.get_json(&url).await?;
+        Ok(comments
+            .into_iter()
+            .filter(|c| !is_bot(&c.user.login, c.user.kind.as_deref()))
+            .map(|c| CommentItem {
+                kind: ItemKind::Conversation,
+                author: c.user.login,
+                body: c.body,
+                replies: Vec::new(),
+                diff_hunk: None,
+                url: c.html_url,
+            })
+            .collect())
     }
-
-    /// All comments on a PR created after `since` — conversation comments and
-    /// inline review comments merged, oldest first.
-    pub async fn new_comments(
-        &self,
-        repo: &str,
-        pr: u64,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<Comment>> {
-        let since_q = since.to_rfc3339();
-        let issue_url = format!(
-            "{API}/repos/{repo}/issues/{pr}/comments?per_page=100&since={since_q}"
-        );
-        let review_url = format!(
-            "{API}/repos/{repo}/pulls/{pr}/comments?per_page=100&since={since_q}"
-        );
-
-        let mut issue: Vec<Comment> = self.get_json(&issue_url).await?;
-        for c in &mut issue {
-            c.source = "issue_comment".to_string();
-        }
-        let mut review: Vec<Comment> = self.get_json(&review_url).await?;
-        for c in &mut review {
-            c.source = "review_comment".to_string();
-        }
-
-        let mut all = issue;
-        all.extend(review);
-        // `since` filters on updated_at (>=); keep strictly-newer creations only,
-        // so edits to old comments and boundary duplicates are dropped.
-        all.retain(|c| c.created_at > since);
-        all.sort_by_key(|c| c.created_at);
-        Ok(all)
-    }
-}
-
-/// Comments we never act on: our own, and bot chatter (CI, coverage, etc.).
-pub fn is_noise(c: &Comment, own_username: &str) -> bool {
-    c.user.login == own_username
-        || c.user.login.ends_with("[bot]")
-        || c.user.kind.as_deref() == Some("Bot")
 }

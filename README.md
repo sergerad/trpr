@@ -1,322 +1,122 @@
 # kwkly
 
-A local Rust daemon that watches your GitHub PRs for new reviewer comments and
-spawns headless [Claude Code](https://claude.com/claude-code) runs to propose
-fixes — as **uncommitted diffs on your machine** for you to review. It never
-commits, never pushes, and never posts to GitHub.
+Address PR review comments with a [Claude Code](https://claude.com/claude-code)
+agent — from inside your checkout, on your terms.
 
+```sh
+cd ~/Source/miden-node        # your checkout, on the PR branch
+kwkly                         # or: kwkly ~/Source/miden-node
 ```
-poll GitHub ──► new comments on your PR ──► debounce ──► git worktree of the
-PR branch ──► headless `claude -p` run ──► PLAN.md + uncommitted diff +
-changes.patch in ~/agent-inbox ──► desktop notification ──► you review
-```
+
+kwkly figures out which GitHub repo and PR your current branch belongs to,
+fetches the PR's **unresolved comments**, and opens a TUI:
+
+1. **Select** — browse the comments (inline review threads + conversation-tab
+   comments, bots filtered out).
+2. **Instruct** — per comment: `a` = implement as the reviewer stated,
+   `e` = write your own instruction ("do this but use a builder instead",
+   "just add a TODO"), `x` = ignore.
+3. **Go** — `g` launches one Claude Code agent run that implements every
+   instructed comment, **editing your checkout in place**. The TUI streams
+   the agent's thinking, tool calls, and output live.
+4. **Review in your IDE** — when it's done, the changes are ordinary
+   uncommitted edits in your working tree. `git diff`, tweak, commit, push —
+   all yours. kwkly never commits, never pushes, never posts to GitHub.
 
 ## Safety model
 
-1. **Read-only GitHub token.** The agent only ever sees a fine-grained PAT
-   with read-only permissions. Even a fully prompt-injected agent cannot
-   push, comment, edit, or merge — the capability doesn't exist.
-2. **Deny rules.** Each run gets `assets/agent-settings.json`: `git commit`,
-   `git push`, and `gh` write subcommands (comment/review/edit/merge/…) are
-   denied at the harness level. `gh api` is allowed for read-only GETs (e.g.
-   fetching a full comment thread) — API writes through it are stopped by
-   layer 1, the read-only token.
-3. **Scoped filesystem.** The agent's cwd is the task's worktree; the only
-   extra writable directory is the task dir (for `PLAN.md` / `REPLY-DRAFT.md`).
-4. **Human gate.** Everything the agent produces sits in `~/agent-inbox`
-   until you commit/push/reply yourself.
+- **Read-only GitHub token.** The agent only ever sees a fine-grained PAT
+  with read-only permissions — it cannot push, comment, or merge via the
+  API even if a malicious comment tries to steer it.
+- **Deny rules.** Each run carries Claude Code permission rules denying
+  `git commit`, `git push`, and every `gh` write subcommand.
+- **Your instructions are the authority.** The prompt tells the agent that
+  comment bodies are untrusted third-party text and your per-comment
+  instructions override them.
+- **Human gate.** Everything ends as uncommitted changes you review before
+  anything reaches GitHub.
 
-PR comments are untrusted third-party input — treat the layers above as the
-defense, not the agent's good behavior.
+Note: because the agent runs in your real checkout, treat the deny rules +
+read-only token as the guardrails and review the diff before pushing — same
+discipline as reviewing any contributor's PR.
 
 ## Requirements
 
-kwkly orchestrates existing tools rather than bundling them — these must be
-on `PATH`:
-
 | Dependency | Used for | Check |
 |---|---|---|
-| Rust toolchain **1.89+** | building kwkly (uses std file locking) | `cargo --version` |
-| [Claude Code](https://claude.com/claude-code) CLI | the agent runtime — every task is a headless `claude -p` run | `claude --version` |
-| `git` | clones, per-PR worktrees, patches | `git --version` |
-| `gh` (GitHub CLI) | the *agent* uses it to read PR context (`gh pr view/diff`) | `gh --version` |
-| `notify-send` (Linux only) | desktop notifications — or set `notifications = false` | `notify-send --version` |
+| Rust toolchain | building kwkly | `cargo --version` |
+| [Claude Code](https://claude.com/claude-code) CLI, logged in | the agent runtime | `claude --version` |
+| `git` | repo/branch discovery, dirty check | `git --version` |
+| `gh` (GitHub CLI) | the *agent* uses it to read PR context | `gh --version` |
 
-Two auth notes:
-
-- **`claude` must be logged in** — run `claude` interactively once and
-  authenticate; headless runs reuse those credentials. Agent runs consume
-  your Claude subscription/API usage like any other Claude Code session.
-- **`gh` does *not* need `gh auth login`** — inside agent runs it
-  authenticates via the read-only PAT that kwkly injects as `GH_TOKEN`.
-
-## Install
-
-```sh
-git clone <this repo> && cd kwkly
-cargo build --release           # binary at target/release/kwkly
-# optional: put it on PATH
-cargo install --path .          # installs to ~/.cargo/bin/kwkly
-```
+Agent runs consume your Claude subscription/API usage like any Claude Code
+session. `gh` needs no login — the agent gets the read-only PAT as `GH_TOKEN`.
 
 ## Setup
 
-1. **Token** — create a [fine-grained PAT](https://github.com/settings/personal-access-tokens)
-   scoped to the repos you watch, with **read-only** Contents, Issues, and
-   Pull requests permissions. Export it:
+1. Create a [fine-grained PAT](https://github.com/settings/personal-access-tokens)
+   with **read-only** Contents, Issues, and Pull requests permissions on the
+   repos you work in. For org-owned repos the PAT's *resource owner* must be
+   the org (not your user), with the repo granted — and the org must
+   allow/approve fine-grained PATs. GitHub returns 404 (not 403) when a
+   token can't see a private repo.
 
    ```sh
    export KWKLY_GITHUB_TOKEN=github_pat_...
    ```
 
-   **Org-owned / private repos:** a fine-grained PAT is bound to a single
-   *resource owner*. To watch repos in an org, the PAT's resource owner must
-   be **that org** (not your user), with the repos granted — and the org must
-   allow fine-grained PATs (some require admin approval per token). GitHub
-   returns 404, not 403, when a token can't see a private repo. Watching
-   repos across multiple owners currently means one kwkly instance per owner
-   (separate configs + inbox dirs), since there's one token per config.
-
-   kwkly authenticates its own `git clone`/`fetch` with this token too
-   (passed per-invocation via git's env config — never written to
-   `.git/config`), so private repos work end to end.
-
-2. **Config** — `cp config.example.toml config.toml` and set your username
-   and repos.
-
-3. **Verify** — `kwkly check` checks the whole chain (binaries, inbox,
-   token, repo visibility) and pinpoints anything broken before you start
-   the daemon.
-
-4. **Run the daemon** (foreground in a terminal is fine; a service is optional):
+2. Build and install:
 
    ```sh
-   cargo run --release            # uses ./config.toml
-   cargo run --release -- /path/to/config.toml
+   cargo install --path .        # installs ~/.cargo/bin/kwkly
    ```
 
-   Log verbosity: `RUST_LOG=kwkly=debug cargo run --release`.
+Optional env knobs: `KWKLY_CLAUDE_BIN` (default `claude`),
+`KWKLY_MAX_TURNS` (default 60).
 
-## CLI
+## TUI keys
 
-The daemon is headless; these subcommands are the interactive layer (run them
-from any terminal while the daemon runs — they read the same inbox):
-
-```sh
-kwkly status     # table of tracked PRs: state, diff ready?, reviewed?
-kwkly review     # walk unreviewed finished tasks one at a time
-kwkly prune      # delete task dirs for PRs that merged/closed (asks first)
-kwkly [daemon]   # the watcher itself
-
-kwkly run <github-pr-or-comment-url>
-                 # trigger one agent run right now
-
-kwkly check [repo-or-url]
-                 # check the setup chain: binaries, inbox, token validity,
-                 # and repo visibility (config repos + the given one)
-```
-
-When something 404s or misbehaves, run `kwkly check <the repo or URL>` first —
-it walks the chain in order (git/gh/claude on PATH → inbox writable → token
-env set → token accepted by GitHub → each repo visible) and reports the first
-broken link, including the fine-grained-PAT resource-owner explanation for
-invisible private repos.
-
-`kwkly run` triggers a real agent run on demand, immediately and in the
-foreground — no polling, no debounce. Paste a URL straight from GitHub:
-
-```sh
-# whole PR → all outstanding comments
-kwkly run https://github.com/owner/repo/pull/176
-
-# one specific comment → exactly that comment ("Copy link" on the comment)
-kwkly run https://github.com/owner/repo/pull/176#discussion_r3826439452   # inline review comment
-kwkly run https://github.com/owner/repo/pull/176#issuecomment-123456789   # conversation comment
-```
-
-With a plain PR URL, "outstanding" means everything the daemon hasn't already
-seen or queued (every comment on the PR if it isn't tracked yet), bots
-excluded but your own comments included — so commenting on your own PR works.
-A comment permalink runs against exactly that comment, unfiltered; if it
-isn't found, kwkly prints each comment's permalink to pick from. Never writes
-state.json; artifact paths are printed when the run finishes.
-
-`kwkly run` **streams the agent's steps live to your terminal**: thinking
-(dimmed), tool calls with a one-line summary of their input, abbreviated tool
-results, and the agent's text as it works.
-
-Daemon tasks render the same step stream to the task's `agent-steps.log`
-(written line-by-line as the agent works), so a running daemon task can be
-watched with:
-
-```sh
-tail -f ~/agent-inbox/<owner>__<repo>/pr-<n>/agent-steps.log
-```
-
-Either way, the full raw event stream is saved to `agent-output.jsonl`.
-
-It doubles as the end-to-end smoke test for a fresh setup — but note it's not
-a dry run: it consumes real Claude usage like any agent run.
-
-`kwkly review` shows each task's `PLAN.md`, then prompts:
-
-| Key | Action |
+| Phase | Keys |
 |---|---|
-| `p` / `d` | show PLAN.md / show the diff (git pager) |
-| `a` | apply `changes.patch` onto your real checkout (`git apply --3way`) |
-| `o` | open interactive `claude` in the worktree to iterate |
-| `x` | discard the worktree changes |
-| `e` | show the agent's stderr log (for failed tasks) |
-| `m` / `s` / `q` | mark reviewed / skip for now / quit |
+| Select | `j`/`k` move · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `g` go · `q` quit |
+| Instruction editor | Enter save · Alt+Enter newline · Esc cancel |
+| Running | `q` abort (kills the agent) · `↑`/`↓`/PgUp/PgDn scroll |
+| Done | `q` quit · scroll as above |
 
-Only the daemon writes `state.json` — a lock file (`daemon.lock`) enforces one
-daemon per `inbox_dir`, so a second instance fails loudly instead of racing.
-Run multiple daemons only with separate configs *and* separate `inbox_dir`s.
+If your working tree has uncommitted changes, kwkly warns in the header and
+asks for confirmation before starting a run (agent edits would mix with
+yours in `git diff`).
 
-## Reviewing a task
+## Run artifacts
 
-Each task lands in `~/agent-inbox/<owner>__<repo>/pr-<n>/`:
+Each run writes to `.kwkly/runs/<timestamp>/` inside your repo:
 
 | File | What it is |
 |---|---|
-| `PLAN.md` | Per-comment classification + what the agent changed and why |
-| `worktree/` | PR branch checkout with the **uncommitted** changes |
-| `changes.patch` | The same changes as a patch (absent if no code changes) |
-| `REPLY-DRAFT.md` | Drafted replies for question-type comments (you post them) |
-| `comments.json` | The comment batch this run responded to |
-| `agent-steps.log` | Human-readable step log (thinking, tool calls, output) — written live; `tail -f` it to watch a running daemon task |
-| `agent-output.jsonl`, `agent-stderr.log` | Full raw event-stream transcript for debugging |
+| `SUMMARY.md` | Agent-written: what it did per comment, open questions |
+| `prompt.md` | The exact prompt the agent was given (your instructions included) |
+| `steps.log` | Human-readable step log (same content the TUI streamed) |
+| `transcript.jsonl` | Full raw agent event stream |
+| `stderr.log` | Claude Code's stderr |
 
-Typical flow: read `PLAN.md`, then `git -C worktree diff`. To iterate, `cd`
-into the worktree and run interactive `claude` — it's a normal checkout.
-When happy, cherry-pick/apply onto your real checkout (or commit and push
-from the worktree yourself). Discard with `git -C worktree checkout .`.
+`.kwkly/` contains a self-ignoring `.gitignore` (`*`), so it's visible in
+your IDE's file tree but never appears in `git status` or your PR diff.
 
-When a PR is merged/closed its state entry is dropped automatically; the
-on-disk task dir stays until you run `kwkly prune` (which confirms before
-deleting anything, including unreviewed changes).
+## What "unresolved comments" means
 
-## Disk usage: what's shared, what isn't
+- Inline review threads whose GitHub thread is **not marked resolved**
+  (fetched via GraphQL — REST doesn't expose resolved state), including
+  outdated ones (marked in the list).
+- All conversation-tab comments — GitHub has no resolved concept for them;
+  ignore the irrelevant ones with `x`.
+- Comments from `[bot]` accounts are hidden.
+- Top-level review summary bodies ("Approve"/"Request changes" text) are
+  not yet included.
 
-Per repo there is exactly **one clone** (`<inbox>/<owner>__<repo>/clone/`) —
-the single git object store. Per-PR checkouts are **git worktrees** of that
-clone: they share all git history/objects and only materialize the working
-files of the PR branch. Git data is never duplicated.
+## Notes
 
-What *can* grow per worktree is build output (`target/`, `node_modules`, …)
-if the agent builds or tests. Three things keep that down:
-
-1. **Rust repos are handled automatically** (`share_build_cache = true`, the
-   default): when a worktree has a root `Cargo.toml`, the agent runs with
-   `CARGO_TARGET_DIR` pointed at `<repo>/build-cache` — one target dir per
-   repo instead of one per worktree. Cargo's own locking handles concurrent
-   builds, and dependency artifacts (the bulk of the size) are reused across
-   PRs. Set `share_build_cache = false` if a repo's tooling assumes
-   `./target` at the conventional path.
-
-2. **Other ecosystems** use the general `agent_env` hook — `"{repo_dir}"`
-   expands to the repo's inbox directory:
-
-   ```toml
-   [agent_env]
-   GOMODCACHE = "{repo_dir}/go-mod-cache"
-   ```
-
-   An explicit `CARGO_TARGET_DIR` here overrides the automatic one.
-
-3. **`kwkly prune`** deletes finished task dirs — including any per-worktree
-   build output — once their PRs merge or close.
-
-## Behavior notes
-
-- **First sighting of a PR is baselined** — old comment history isn't replayed;
-  only comments arriving after the daemon starts watching are processed.
-- **Debounce**: a burst of review comments becomes one agent run
-  (`debounce_secs` of quiet required before dispatch).
-- **Comments during a run** are queued and trigger a follow-up run in the
-  same worktree, building on the previous (still unreviewed) changes.
-- Your own comments and `[bot]` accounts are ignored.
-- Crash-safe: state is a JSON file; interrupted runs are re-dispatched on
-  restart from the persisted `comments.json`.
-
-## Platform support
-
-macOS and Linux. The daemon itself is portable; the only platform-specific
-piece is desktop notifications — `osascript` on macOS (built in), `notify-send`
-on Linux (install `libnotify` / `libnotify-bin` from your package manager, or
-set `notifications = false`).
-
-## Run as a service — macOS (launchd)
-
-launchd is macOS's service manager: it starts the daemon at login, restarts it
-if it crashes, and captures logs.
-
-`~/Library/LaunchAgents/com.kwkly.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.kwkly</string>
-  <key>ProgramArguments</key><array>
-    <string>/path/to/kwkly/target/release/kwkly</string>
-    <string>/path/to/kwkly/config.toml</string>
-  </array>
-  <key>EnvironmentVariables</key><dict>
-    <key>KWKLY_GITHUB_TOKEN</key><string>github_pat_...</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/kwkly.log</string>
-  <key>StandardErrorPath</key><string>/tmp/kwkly.log</string>
-</dict></plist>
-```
-
-Then `launchctl load ~/Library/LaunchAgents/com.kwkly.plist`.
-(Better: keep the token out of the plist by wrapping the binary in a small
-script that reads it from the macOS Keychain via `security find-generic-password`.)
-
-## Run as a service — Linux (systemd user service)
-
-`~/.config/systemd/user/kwkly.service`:
-
-```ini
-[Unit]
-Description=kwkly PR-comment agent daemon
-
-[Service]
-ExecStart=/path/to/kwkly/target/release/kwkly /path/to/kwkly/config.toml
-# Better than an inline token: EnvironmentFile=%h/.config/kwkly/env (chmod 600)
-Environment=KWKLY_GITHUB_TOKEN=github_pat_...
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now kwkly   # start now + at every login
-journalctl --user -u kwkly -f         # follow logs
-loginctl enable-linger $USER            # keep running while logged out
-```
-
-How the two map:
-
-| launchd | systemd user service |
-|---|---|
-| `~/Library/LaunchAgents/*.plist` | `~/.config/systemd/user/*.service` |
-| `launchctl load` | `systemctl --user enable --now` |
-| `KeepAlive` | `Restart=always` |
-| `StandardOutPath` | journald (`journalctl --user -u kwkly`) |
-
-## Not yet implemented
-
-- Issue-assignment tasks (currently PR comments only)
-- Top-level PR review bodies (the "Approve/Request changes" summary text —
-  only inline + conversation comments are watched)
-- Pagination past 100 open PRs / 100 new comments per poll
-- A `confirm_dispatch` mode (approve each agent run before it starts)
-# kwkly
+- The PR is found by matching your current branch against open PRs' head
+  branches (works for same-repo and fork-headed PRs). No open PR → error.
+- kwkly holds no state between invocations: every launch re-fetches the
+  PR's comments fresh. Resolve handled threads on GitHub (or re-`x` them)
+  to keep the list short.
