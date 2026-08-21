@@ -16,7 +16,7 @@ fetches the PR's **unresolved comments**, and opens a TUI:
 2. **Instruct** — per comment: `a` = implement as the reviewer stated,
    `e` = write your own instruction ("do this but use a builder instead",
    "just add a TODO"), `x` = ignore.
-3. **Go** — `g` launches one Claude Code agent run that implements every
+3. **Run** — `r` launches one Claude Code agent run that implements every
    instructed comment, **editing your checkout in place**. The TUI streams
    the agent's thinking, tool calls, and output live.
 4. **Review in your IDE** — when it's done, the changes are ordinary
@@ -76,11 +76,15 @@ Optional env knobs: `TRPR_CLAUDE_BIN` (default `claude`),
 
 ## TUI keys
 
+Navigation is vim-flavored: `j`/`k` line movement, `gg`/`G` jump to
+top/bottom, `Ctrl-d`/`Ctrl-u` jump by 10 — all acting on whichever pane has
+focus (Tab toggles list ↔ detail).
+
 | Phase | Keys |
 |---|---|
-| Select | `j`/`k` move · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `g` go · `q` quit |
+| Select | Tab toggle focus · `j`/`k` move/scroll · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `r` run · `q` quit |
 | Instruction editor | Enter save · Alt+Enter newline · Esc cancel |
-| Running | `q` abort (kills the agent) · `↑`/`↓`/PgUp/PgDn scroll |
+| Running | `q` abort (kills the agent) · `j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u` scroll |
 | Done | `q` quit · scroll as above |
 
 If your working tree has uncommitted changes, trpr warns in the header and

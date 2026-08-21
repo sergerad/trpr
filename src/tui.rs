@@ -20,6 +20,12 @@ pub struct AppCtx {
     pub max_turns: u32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Focus {
+    List,
+    Detail,
+}
+
 #[derive(Clone, PartialEq)]
 pub enum Decision {
     Pending,
@@ -50,6 +56,12 @@ pub struct App {
     pub dirty: bool,
     pub items: Vec<UiItem>,
     pub selected: usize,
+    /// Which pane j/k act on in the Select phase.
+    pub focus: Focus,
+    /// Scroll offset of the detail pane (Select phase), in wrapped lines.
+    pub detail_scroll: u16,
+    /// A lone 'g' was just pressed (vim-style gg pending).
+    pub pending_g: bool,
     pub phase: Phase,
     pub log: Vec<Step>,
     /// Scroll offset from the bottom of the log (0 = follow).
@@ -82,6 +94,9 @@ impl App {
                 .map(|item| UiItem { item, decision: Decision::Pending })
                 .collect(),
             selected: 0,
+            focus: Focus::List,
+            detail_scroll: 0,
+            pending_g: false,
             phase: Phase::Select,
             log: Vec::new(),
             log_offset: 0,
@@ -214,6 +229,20 @@ async fn event_loop(
     }
 }
 
+/// The detail pane's maximum scroll offset — the comment's (unwrapped) line
+/// count. Wrapped height is >= that, so the bottom stays reachable without
+/// endless blank scrolling.
+fn detail_max(app: &App) -> u16 {
+    app.items
+        .get(app.selected)
+        .map(|i| detail_text(i).lines.len() as u16)
+        .unwrap_or(0)
+}
+
+fn scroll_detail_down(app: &mut App, n: u16) {
+    app.detail_scroll = app.detail_scroll.saturating_add(n).min(detail_max(app));
+}
+
 async fn recv_opt(rx: &mut Option<UnboundedReceiver<RunEvent>>) -> Option<RunEvent> {
     match rx {
         Some(r) => r.recv().await,
@@ -222,17 +251,80 @@ async fn recv_opt(rx: &mut Option<UnboundedReceiver<RunEvent>>) -> Option<RunEve
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
+    // vim-style gg: a lone 'g' arms this; any other key disarms it.
+    let pending_g = std::mem::take(&mut app.pending_g);
     match &mut app.phase {
         Phase::Select => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
-            KeyCode::Down | KeyCode::Char('j') => {
-                if app.selected + 1 < app.items.len() {
-                    app.selected += 1;
+            KeyCode::Tab => {
+                app.focus = match app.focus {
+                    Focus::List => Focus::Detail,
+                    Focus::Detail => Focus::List,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => match app.focus {
+                Focus::List => {
+                    if app.selected + 1 < app.items.len() {
+                        app.selected += 1;
+                    }
+                    app.detail_scroll = 0;
+                }
+                Focus::Detail => scroll_detail_down(app, 1),
+            },
+            KeyCode::Up | KeyCode::Char('k') => match app.focus {
+                Focus::List => {
+                    app.selected = app.selected.saturating_sub(1);
+                    app.detail_scroll = 0;
+                }
+                Focus::Detail => app.detail_scroll = app.detail_scroll.saturating_sub(1),
+            },
+            KeyCode::PageDown => scroll_detail_down(app, 10),
+            KeyCode::PageUp => {
+                app.detail_scroll = app.detail_scroll.saturating_sub(10);
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match app.focus {
+                    Focus::List => {
+                        app.selected =
+                            (app.selected + 10).min(app.items.len().saturating_sub(1));
+                        app.detail_scroll = 0;
+                    }
+                    Focus::Detail => scroll_detail_down(app, 10),
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                app.selected = app.selected.saturating_sub(1);
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match app.focus {
+                    Focus::List => {
+                        app.selected = app.selected.saturating_sub(10);
+                        app.detail_scroll = 0;
+                    }
+                    Focus::Detail => {
+                        app.detail_scroll = app.detail_scroll.saturating_sub(10)
+                    }
+                }
             }
+            KeyCode::Char('g') => {
+                if pending_g {
+                    match app.focus {
+                        Focus::List => {
+                            app.selected = 0;
+                            app.detail_scroll = 0;
+                        }
+                        Focus::Detail => app.detail_scroll = 0,
+                    }
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => match app.focus {
+                Focus::List => {
+                    app.selected = app.items.len().saturating_sub(1);
+                    app.detail_scroll = 0;
+                }
+                Focus::Detail => {
+                    app.detail_scroll = detail_max(app);
+                }
+            },
             KeyCode::Char('a') => {
                 if let Some(item) = app.items.get_mut(app.selected) {
                     item.decision = Decision::Instructed(
@@ -258,7 +350,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
                     app.phase = Phase::Edit { buffer };
                 }
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('r') => {
                 if app.instructed_count() == 0 {
                     app.notice =
                         Some("nothing to do — instruct at least one comment (a or e)".into());
@@ -297,22 +389,42 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
         },
         Phase::Running => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Abort,
-            KeyCode::Up => app.log_offset = (app.log_offset + 1).min(app.log.len()),
-            KeyCode::Down => app.log_offset = app.log_offset.saturating_sub(1),
-            KeyCode::PageUp => app.log_offset = (app.log_offset + 20).min(app.log.len()),
-            KeyCode::PageDown => app.log_offset = app.log_offset.saturating_sub(20),
-            _ => {}
+            other => log_scroll_key(app, other, key.modifiers, pending_g),
         },
         Phase::Done { .. } => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
-            KeyCode::Up => app.log_offset = (app.log_offset + 1).min(app.log.len()),
-            KeyCode::Down => app.log_offset = app.log_offset.saturating_sub(1),
-            KeyCode::PageUp => app.log_offset = (app.log_offset + 20).min(app.log.len()),
-            KeyCode::PageDown => app.log_offset = app.log_offset.saturating_sub(20),
-            _ => {}
+            other => log_scroll_key(app, other, key.modifiers, pending_g),
         },
     }
     Flow::Continue
+}
+
+/// Shared scrolling for the run-log view (Running and Done phases).
+/// log_offset counts up from the bottom: 0 = follow the tail.
+fn log_scroll_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers, pending_g: bool) {
+    let up = |app: &mut App, n: usize| {
+        app.log_offset = (app.log_offset + n).min(app.log.len());
+    };
+    let down = |app: &mut App, n: usize| {
+        app.log_offset = app.log_offset.saturating_sub(n);
+    };
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => up(app, 1),
+        KeyCode::Down | KeyCode::Char('j') => down(app, 1),
+        KeyCode::PageUp => up(app, 20),
+        KeyCode::PageDown => down(app, 20),
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => up(app, 10),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => down(app, 10),
+        KeyCode::Char('g') => {
+            if pending_g {
+                app.log_offset = app.log.len(); // top
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('G') => app.log_offset = 0, // bottom (follow)
+        _ => {}
+    }
 }
 
 /// .trpr/runs/<timestamp>, plus the self-ignoring .trpr/.gitignore so the
@@ -423,11 +535,19 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
             ))
         })
         .collect();
+    let focused = Style::new().fg(Color::Cyan);
+    let unfocused = Style::new().fg(Color::DarkGray);
+    let (list_border, detail_border) = match app.focus {
+        Focus::List => (focused, unfocused),
+        Focus::Detail => (unfocused, focused),
+    };
+
     let list = List::new(items)
-        .block(Block::bordered().title(format!(
-            "comments ({} to implement)",
-            app.instructed_count()
-        )))
+        .block(
+            Block::bordered()
+                .border_style(list_border)
+                .title(format!("comments ({} to implement)", app.instructed_count())),
+        )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(app.selected.min(app.items.len().saturating_sub(1))));
@@ -438,10 +558,17 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
         .get(app.selected)
         .map(detail_text)
         .unwrap_or_default();
+    let title = match (app.focus, app.detail_scroll) {
+        (Focus::Detail, 0) => "detail — j/k scroll · Tab back".to_string(),
+        (Focus::Detail, n) => format!("detail — j/k scroll (+{n}) · Tab back"),
+        (Focus::List, 0) => "detail — Tab to focus & scroll".to_string(),
+        (Focus::List, n) => format!("detail (+{n}) — Tab to focus & scroll"),
+    };
     f.render_widget(
         Paragraph::new(detail)
-            .block(Block::bordered().title("detail"))
-            .wrap(Wrap { trim: false }),
+            .block(Block::bordered().border_style(detail_border).title(title))
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_scroll, 0)),
         right,
     );
 }
@@ -524,9 +651,14 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.phase {
-        Phase::Select => lines.push(Line::raw(
-            "j/k move · a implement-as-stated · e edit instruction · x ignore · g go · q quit",
-        )),
+        Phase::Select => lines.push(Line::raw(match app.focus {
+            Focus::List => {
+                "j/k move · gg/G top/bot · ^d/^u jump · Tab→detail · a as-stated · e edit · x ignore · r run · q quit"
+            }
+            Focus::Detail => {
+                "j/k scroll · gg/G top/bot · ^d/^u jump · Tab→list · a as-stated · e edit · x ignore · r run · q quit"
+            }
+        })),
         Phase::Edit { .. } => lines.push(Line::raw(
             "Enter save · Alt+Enter newline · Esc cancel",
         )),
@@ -534,7 +666,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Phase::Running => {
             let elapsed = app.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let quiet = app.last_event.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            let mut s = format!("running {elapsed}s · q abort · ↑/↓ scroll");
+            let mut s = format!("running {elapsed}s · q abort · j/k gg/G ^d/^u scroll");
             if quiet >= 30 {
                 s.push_str(&format!(
                     " · last output {quiet}s ago (long tool calls show nothing until done)"
