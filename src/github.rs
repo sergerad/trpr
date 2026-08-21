@@ -60,13 +60,17 @@ impl Gh {
         Ok(Self { http, token })
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let resp = self
-            .http
+    fn req(&self, url: &str) -> reqwest::RequestBuilder {
+        self.http
             .get(url)
             .bearer_auth(&self.token)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let resp = self
+            .req(url)
             .send()
             .await
             .with_context(|| format!("GET {url}"))?;
@@ -80,6 +84,31 @@ impl Gh {
 
     pub async fn pr(&self, repo: &str, number: u64) -> Result<Pr> {
         self.get_json(&format!("{API}/repos/{repo}/pulls/{number}")).await
+    }
+
+    /// Who the token authenticates as (fine-grained PATs act as their user
+    /// regardless of resource owner).
+    pub async fn whoami(&self) -> Result<String> {
+        let v: serde_json::Value = self.get_json(&format!("{API}/user")).await?;
+        Ok(v["login"].as_str().unwrap_or("?").to_string())
+    }
+
+    /// Whether the token can see a repo: Some(is_private) if visible, None on
+    /// GitHub's 404 (which it returns for both "no access" and "no such repo").
+    pub async fn repo_meta(&self, repo: &str) -> Result<Option<bool>> {
+        let resp = self
+            .req(&format!("{API}/repos/{repo}"))
+            .send()
+            .await
+            .with_context(|| format!("GET /repos/{repo}"))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            bail!("GET /repos/{repo} -> {}", resp.status());
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(Some(v["private"].as_bool().unwrap_or(false)))
     }
 
     pub async fn open_prs(&self, repo: &str) -> Result<Vec<Pr>> {

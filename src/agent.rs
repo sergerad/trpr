@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tracing::{error, info};
 
 const PROMPT_TEMPLATE: &str = include_str!("../assets/prompt.md");
@@ -23,6 +23,10 @@ pub struct TaskCtx {
     pub max_turns: u32,
     pub github_token: String,
     pub notifications: bool,
+    /// Print the agent's steps (thinking, tool calls, text) live to stdout.
+    /// On for foreground `kwkly run`; off for daemon tasks (which may run
+    /// several agents concurrently — their transcripts go to files instead).
+    pub stream_output: bool,
     pub share_build_cache: bool,
     pub agent_env: std::collections::HashMap<String, String>,
     pub comments: Vec<Comment>,
@@ -129,7 +133,8 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
     cmd.args([
         "-p",
         "--output-format",
-        "json",
+        "stream-json", // JSONL event stream; --verbose is required with it in print mode
+        "--verbose",
         "--max-turns",
         &ctx.max_turns.to_string(),
         "--settings",
@@ -172,11 +177,54 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
         .await?;
     // Closing stdin (drop) signals end of prompt.
 
-    let output = child.wait_with_output().await.context("waiting for claude")?;
-    std::fs::write(task_dir.join("agent-output.json"), &output.stdout)?;
-    std::fs::write(task_dir.join("agent-stderr.log"), &output.stderr)?;
+    // Drain stderr concurrently so the child can't block on a full pipe.
+    let mut stderr_pipe = child.stderr.take().context("child stderr unavailable")?;
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf).await;
+        buf
+    });
 
-    let (ok, summary) = parse_agent_output(&output.stdout, output.status.success());
+    // Stream events line by line. Every raw line goes to the transcript file
+    // (agent-output.jsonl); rendered human-readable steps go to
+    // agent-steps.log — both written live, so a daemon task can be watched
+    // with `tail -f`. With stream_output on, steps also print to stdout
+    // (styled). The final "result" event carries success + summary.
+    let stdout_pipe = child.stdout.take().context("child stdout unavailable")?;
+    let mut transcript = std::fs::File::create(task_dir.join("agent-output.jsonl"))?;
+    let mut steps_log = std::fs::File::create(task_dir.join("agent-steps.log"))?;
+    let mut lines = tokio::io::BufReader::new(stdout_pipe).lines();
+    let mut ok: Option<bool> = None;
+    let mut summary = String::new();
+    while let Some(line) = lines.next_line().await.context("reading agent stream")? {
+        use std::io::Write as _;
+        writeln!(transcript, "{line}")?;
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if event["type"].as_str() == Some("result") {
+            ok = Some(!event["is_error"].as_bool().unwrap_or(false));
+            summary = truncate(event["result"].as_str().unwrap_or(""), 500);
+            writeln!(steps_log, "── result: {}", if ok == Some(true) { "ok" } else { "ERROR" })?;
+        } else {
+            for step in render_event(&event) {
+                writeln!(steps_log, "{}", step.text)?;
+                if ctx.stream_output {
+                    println!("{}", step.styled());
+                }
+            }
+        }
+    }
+
+    let status = child.wait().await.context("waiting for claude")?;
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+    std::fs::write(task_dir.join("agent-stderr.log"), &stderr_buf)?;
+
+    let ok = ok.unwrap_or_else(|| status.success());
+    if summary.is_empty() && !ok {
+        summary = "agent exited abnormally — see agent-stderr.log".to_string();
+    }
     let has_diff = worktree::write_patch(&wt, &task_dir.join("changes.patch")).await?;
 
     Ok(TaskResult {
@@ -187,20 +235,124 @@ async fn run_inner(ctx: &TaskCtx, task_dir: &Path) -> Result<TaskResult> {
     })
 }
 
-/// `--output-format json` yields a single object with `is_error` and a final
-/// `result` string. Fall back gracefully if the shape ever changes.
-fn parse_agent_output(stdout: &[u8], exit_ok: bool) -> (bool, String) {
-    match serde_json::from_slice::<serde_json::Value>(stdout) {
-        Ok(v) => {
-            let is_error = v["is_error"].as_bool().unwrap_or(!exit_ok);
-            let mut summary = v["result"].as_str().unwrap_or("").to_string();
-            if summary.len() > 500 {
-                summary.truncate(500);
-                summary.push('…');
+/// One rendered line of agent activity. `text` is plain (what the step log
+/// gets); `styled()` adds terminal colors for live stdout streaming.
+struct Step {
+    kind: StepKind,
+    text: String,
+}
+
+enum StepKind {
+    Meta,
+    Thinking,
+    Text,
+    ToolUse,
+    ToolResult,
+}
+
+impl Step {
+    fn styled(&self) -> String {
+        match self.kind {
+            StepKind::Thinking | StepKind::ToolResult | StepKind::Meta => {
+                format!("\x1b[2m{}\x1b[0m", self.text) // dim
             }
-            (!is_error, summary)
+            StepKind::ToolUse => format!("\x1b[1m{}\x1b[0m", self.text), // bold
+            StepKind::Text => self.text.clone(),
         }
-        Err(_) => (exit_ok, "agent output was not valid JSON".to_string()),
+    }
+}
+
+/// Human-readable rendering of one stream-json event, mirroring the shape of
+/// an interactive Claude Code session: thinking, text, tool calls, results.
+fn render_event(event: &serde_json::Value) -> Vec<Step> {
+    let mut out = Vec::new();
+    let mut push = |kind: StepKind, text: String| out.push(Step { kind, text });
+    match event["type"].as_str() {
+        Some("system") if event["subtype"].as_str() == Some("init") => {
+            if let Some(model) = event["model"].as_str() {
+                push(StepKind::Meta, format!("· session started ({model})"));
+            }
+        }
+        Some("assistant") => {
+            if let Some(blocks) = event["message"]["content"].as_array() {
+                for b in blocks {
+                    match b["type"].as_str() {
+                        Some("thinking") => {
+                            for l in b["thinking"].as_str().unwrap_or("").lines() {
+                                push(StepKind::Thinking, format!("✻ {l}"));
+                            }
+                        }
+                        Some("text") => {
+                            for l in b["text"].as_str().unwrap_or("").lines() {
+                                push(StepKind::Text, l.to_string());
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = b["name"].as_str().unwrap_or("?");
+                            push(
+                                StepKind::ToolUse,
+                                format!("⏺ {name}({})", brief_input(&b["input"])),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Some("user") => {
+            if let Some(blocks) = event["message"]["content"].as_array() {
+                for b in blocks {
+                    if b["type"].as_str() == Some("tool_result") {
+                        let text = tool_result_text(b);
+                        let first = text.lines().next().unwrap_or("");
+                        let more = text.lines().count().saturating_sub(1);
+                        let mut line = format!("  ⎿ {}", truncate(first, 160));
+                        if more > 0 {
+                            line.push_str(&format!(" (+{more} lines)"));
+                        }
+                        push(StepKind::ToolResult, line);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// The most informative one-liner for a tool call's input.
+fn brief_input(input: &serde_json::Value) -> String {
+    for key in ["command", "file_path", "path", "pattern", "url"] {
+        if let Some(v) = input[key].as_str() {
+            return truncate(v, 120);
+        }
+    }
+    truncate(&input.to_string(), 120)
+}
+
+/// tool_result content is either a plain string or a list of text blocks.
+fn tool_result_text(block: &serde_json::Value) -> String {
+    if let Some(s) = block["content"].as_str() {
+        return s.to_string();
+    }
+    if let Some(parts) = block["content"].as_array() {
+        return parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    String::new()
+}
+
+/// Char-boundary-safe truncation with an ellipsis.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max).collect();
+        t.push('…');
+        t
     }
 }
 

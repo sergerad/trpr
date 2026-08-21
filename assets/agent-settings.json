@@ -30,7 +30,6 @@
       "Bash(gh issue edit:*)",
       "Bash(gh issue close:*)",
       "Bash(gh issue create:*)",
-      "Bash(gh api:*)",
       "Bash(gh repo:*)",
       "Bash(gh release:*)",
       "Bash(gh workflow:*)",

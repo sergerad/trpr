@@ -421,7 +421,7 @@ pub async fn run_once(cfg: &Config, target: RunTarget) -> Result<()> {
             body.truncate(99);
             body.push('…');
         }
-        println!("Testing against [{}] @{}: {}", c.source, c.user.login, body);
+        println!("Running against [{}] @{}: {}", c.source, c.user.login, body);
     }
 
     // Warn if a daemon holds this inbox — a manual run on a PR the daemon is
@@ -448,6 +448,7 @@ pub async fn run_once(cfg: &Config, target: RunTarget) -> Result<()> {
         max_turns: cfg.max_turns,
         github_token: token,
         notifications: cfg.notifications,
+        stream_output: true, // foreground run: show the agent's steps live
         share_build_cache: cfg.share_build_cache,
         agent_env: cfg.agent_env.clone(),
         comments: selected,
@@ -480,6 +481,92 @@ pub async fn run_once(cfg: &Config, target: RunTarget) -> Result<()> {
     println!("  patch:    {}", task_dir.join("changes.patch").display());
     println!("  log:      {}", task_dir.join("agent-stderr.log").display());
     Ok(())
+}
+
+// ---------------------------------------------------------------- check ---
+
+/// Check every link in the setup chain and report which one is broken:
+/// binaries on PATH, inbox writable, token env set, token valid, and repo
+/// visibility (config repos plus an optional extra repo/URL to probe).
+pub async fn check(cfg: &Config, extra_repo: Option<String>) -> Result<()> {
+    println!("kwkly check\n");
+
+    let claude = cfg.claude_bin.as_str();
+    for (label, bin) in [("git", "git"), ("gh", "gh"), ("claude", claude)] {
+        match Command::new(bin).arg("--version").output() {
+            Ok(o) if o.status.success() => {
+                let v = String::from_utf8_lossy(&o.stdout);
+                println!("  ok  {label}: {}", v.lines().next().unwrap_or("").trim());
+            }
+            _ => println!("  !!  {label}: `{bin}` not found on PATH or failing"),
+        }
+    }
+
+    match std::fs::create_dir_all(&cfg.inbox_dir) {
+        Ok(()) => println!("  ok  inbox writable: {}", cfg.inbox_dir.display()),
+        Err(e) => println!("  !!  inbox {}: {e}", cfg.inbox_dir.display()),
+    }
+
+    let token = match cfg.github_token() {
+        Ok(t) => {
+            println!("  ok  ${} is set in this shell", cfg.github_token_env);
+            t
+        }
+        Err(e) => {
+            println!("  !!  {e:#}");
+            return Ok(()); // everything below needs the token
+        }
+    };
+
+    let gh = crate::github::Gh::new(token)?;
+    match gh.whoami().await {
+        Ok(login) => println!("  ok  token authenticates as @{login}"),
+        Err(e) => {
+            println!("  !!  GitHub rejected the token: {e:#}");
+            return Ok(());
+        }
+    }
+
+    let mut repos = cfg.repos.clone();
+    if let Some(r) = extra_repo {
+        if !repos.contains(&r) {
+            repos.push(r);
+        }
+    }
+    if repos.is_empty() {
+        println!("  --  no repos to check (none in config, none given)");
+    }
+    for repo in &repos {
+        match gh.repo_meta(repo).await {
+            Ok(Some(private)) => println!(
+                "  ok  {repo}: visible ({})",
+                if private { "private" } else { "public" }
+            ),
+            Ok(None) => {
+                let owner = repo.split('/').next().unwrap_or("?");
+                println!(
+                    "  !!  {repo}: NOT visible to this token. For a private repo the \
+                     fine-grained PAT must have '{owner}' as its RESOURCE OWNER (not your \
+                     user) with this repo granted, and the org must allow/approve the \
+                     token — check its status at github.com/settings/personal-access-tokens"
+                );
+            }
+            Err(e) => println!("  !!  {repo}: {e:#}"),
+        }
+    }
+    Ok(())
+}
+
+/// Accepts "owner/name" or any github.com URL; returns "owner/name".
+pub fn normalize_repo_arg(input: &str) -> Option<String> {
+    let s = input.trim();
+    let s = s.strip_prefix("https://").or_else(|| s.strip_prefix("http://")).unwrap_or(s);
+    let s = s.strip_prefix("www.").unwrap_or(s);
+    let path = s.strip_prefix("github.com/").unwrap_or(s);
+    let mut segs = path.split('/').filter(|p| !p.is_empty());
+    let owner = segs.next()?;
+    let name = segs.next()?;
+    Some(format!("{owner}/{name}"))
 }
 
 // --------------------------------------------------------------- helpers ---

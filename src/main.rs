@@ -23,6 +23,9 @@ USAGE:
   kwkly status [config.toml]     list tracked PRs and finished tasks
   kwkly review [config.toml]     walk unreviewed tasks interactively
   kwkly prune  [config.toml]     delete task dirs for merged/closed PRs
+  kwkly check [repo] [config.toml]
+      check the setup chain: binaries, inbox, token, repo visibility
+      (repo may be owner/name or any github.com URL)
 
   kwkly run <github-pr-or-comment-url> [config.toml]
       trigger one agent run right now, bypassing polling and debounce.
@@ -53,6 +56,23 @@ async fn main() -> Result<()> {
             let cfg_path = args.get(2).map(|s| s.as_str()).unwrap_or("config.toml");
             let cfg = config::Config::load(cfg_path)?;
             return cli::run_once(&cfg, target).await;
+        }
+        Some("check") => {
+            // Args after "check": a repo (owner/name or github URL) and/or a
+            // config path — .toml means config, anything else is the repo.
+            let mut extra_repo = None;
+            let mut cfg_path = "config.toml".to_string();
+            for a in &args[1..] {
+                if a.ends_with(".toml") {
+                    cfg_path = a.clone();
+                } else if let Some(r) = cli::normalize_repo_arg(a) {
+                    extra_repo = Some(r);
+                } else {
+                    bail!("unrecognized check argument: {a}");
+                }
+            }
+            let cfg = config::Config::load(&cfg_path)?;
+            return cli::check(&cfg, extra_repo).await;
         }
         Some(m @ ("daemon" | "status" | "review" | "prune")) => (m, args.get(1)),
         // Legacy form: bare positional arg is a config path for the daemon.
@@ -269,6 +289,7 @@ fn dispatch_ready(
                 max_turns: cfg.max_turns,
                 github_token: token.to_string(),
                 notifications: cfg.notifications,
+                stream_output: false,
                 share_build_cache: cfg.share_build_cache,
                 agent_env: cfg.agent_env.clone(),
                 comments: std::mem::take(&mut pr.pending_comments),

@@ -17,7 +17,10 @@ changes.patch in ~/agent-inbox ──► desktop notification ──► you revi
    with read-only permissions. Even a fully prompt-injected agent cannot
    push, comment, edit, or merge — the capability doesn't exist.
 2. **Deny rules.** Each run gets `assets/agent-settings.json`: `git commit`,
-   `git push`, and all `gh` write subcommands are denied at the harness level.
+   `git push`, and `gh` write subcommands (comment/review/edit/merge/…) are
+   denied at the harness level. `gh api` is allowed for read-only GETs (e.g.
+   fetching a full comment thread) — API writes through it are stopped by
+   layer 1, the read-only token.
 3. **Scoped filesystem.** The agent's cwd is the task's worktree; the only
    extra writable directory is the task dir (for `PLAN.md` / `REPLY-DRAFT.md`).
 4. **Human gate.** Everything the agent produces sits in `~/agent-inbox`
@@ -81,7 +84,11 @@ cargo install --path .          # installs to ~/.cargo/bin/kwkly
 2. **Config** — `cp config.example.toml config.toml` and set your username
    and repos.
 
-3. **Run the daemon** (foreground in a terminal is fine; a service is optional):
+3. **Verify** — `kwkly check` checks the whole chain (binaries, inbox,
+   token, repo visibility) and pinpoints anything broken before you start
+   the daemon.
+
+4. **Run the daemon** (foreground in a terminal is fine; a service is optional):
 
    ```sh
    cargo run --release            # uses ./config.toml
@@ -103,7 +110,17 @@ kwkly [daemon]   # the watcher itself
 
 kwkly run <github-pr-or-comment-url>
                  # trigger one agent run right now
+
+kwkly check [repo-or-url]
+                 # check the setup chain: binaries, inbox, token validity,
+                 # and repo visibility (config repos + the given one)
 ```
+
+When something 404s or misbehaves, run `kwkly check <the repo or URL>` first —
+it walks the chain in order (git/gh/claude on PATH → inbox writable → token
+env set → token accepted by GitHub → each repo visible) and reports the first
+broken link, including the fine-grained-PAT resource-owner explanation for
+invisible private repos.
 
 `kwkly run` triggers a real agent run on demand, immediately and in the
 foreground — no polling, no debounce. Paste a URL straight from GitHub:
@@ -123,6 +140,20 @@ excluded but your own comments included — so commenting on your own PR works.
 A comment permalink runs against exactly that comment, unfiltered; if it
 isn't found, kwkly prints each comment's permalink to pick from. Never writes
 state.json; artifact paths are printed when the run finishes.
+
+`kwkly run` **streams the agent's steps live to your terminal**: thinking
+(dimmed), tool calls with a one-line summary of their input, abbreviated tool
+results, and the agent's text as it works.
+
+Daemon tasks render the same step stream to the task's `agent-steps.log`
+(written line-by-line as the agent works), so a running daemon task can be
+watched with:
+
+```sh
+tail -f ~/agent-inbox/<owner>__<repo>/pr-<n>/agent-steps.log
+```
+
+Either way, the full raw event stream is saved to `agent-output.jsonl`.
 
 It doubles as the end-to-end smoke test for a fresh setup — but note it's not
 a dry run: it consumes real Claude usage like any agent run.
@@ -153,7 +184,8 @@ Each task lands in `~/agent-inbox/<owner>__<repo>/pr-<n>/`:
 | `changes.patch` | The same changes as a patch (absent if no code changes) |
 | `REPLY-DRAFT.md` | Drafted replies for question-type comments (you post them) |
 | `comments.json` | The comment batch this run responded to |
-| `agent-output.json`, `agent-stderr.log` | Run transcript for debugging |
+| `agent-steps.log` | Human-readable step log (thinking, tool calls, output) — written live; `tail -f` it to watch a running daemon task |
+| `agent-output.jsonl`, `agent-stderr.log` | Full raw event-stream transcript for debugging |
 
 Typical flow: read `PLAN.md`, then `git -C worktree diff`. To iterate, `cd`
 into the worktree and run interactive `claude` — it's a normal checkout.
