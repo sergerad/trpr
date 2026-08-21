@@ -41,6 +41,18 @@ pub struct TaskResult {
 /// Running, then fires a desktop notification.
 pub async fn run_task(ctx: TaskCtx) {
     let task_dir = worktree::task_dir(&ctx.inbox_dir, &ctx.repo, ctx.pr_number);
+
+    if ctx.notifications {
+        let title = format!("kwkly: {} #{}", ctx.repo, ctx.pr_number);
+        // Empty comments = crash-recovered task re-running from comments.json.
+        let msg = if ctx.comments.is_empty() {
+            "Agent started (resuming recovered task)".to_string()
+        } else {
+            format!("Agent started on {} new comment(s)", ctx.comments.len())
+        };
+        notify::notify(&title, &msg).await;
+    }
+
     let result = match run_inner(&ctx, &task_dir).await {
         Ok(r) => r,
         Err(e) => {

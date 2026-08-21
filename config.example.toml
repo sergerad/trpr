@@ -31,7 +31,7 @@ only_my_prs = true
 # to GitHub even if a malicious comment tries to steer it.
 github_token_env = "KWKLY_GITHUB_TOKEN"
 
-# Desktop notifications when a task finishes.
+# Desktop notifications when a task starts and finishes.
 # macOS: uses osascript (built in). Linux: needs notify-send (libnotify).
 notifications = true
 
