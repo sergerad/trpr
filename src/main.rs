@@ -38,6 +38,13 @@ async fn main() -> Result<()> {
     };
 
     let gctx = git::discover(&dir)?;
+    if gctx.dirty {
+        anyhow::bail!(
+            "working tree has uncommitted changes — commit or stash them first \
+             (trpr commits per handled comment, so it needs a clean tree to keep \
+             its commits attributable)"
+        );
+    }
     let token = std::env::var("TRPR_GITHUB_TOKEN").context(
         "TRPR_GITHUB_TOKEN not set — export a fine-grained PAT with READ-ONLY \
          Contents/Issues/Pull-requests permissions on this repo",
@@ -64,14 +71,21 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Cross-session awareness: commits with `Addresses:` trailers on the
+    // branch mark comments already handled; the ignored file marks ones you
+    // decided to skip.
+    let handled = git::addressed_commits(&gctx.root);
+    let ignored = tui::load_ignored(&gctx.repo, pr.number);
+
     let app = tui::App::new(
         gctx.repo,
         gctx.root,
         gctx.branch,
         pr.number,
         pr.title,
-        gctx.dirty,
         items,
+        handled,
+        ignored,
     );
     let actx = tui::AppCtx {
         token,

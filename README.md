@@ -17,11 +17,26 @@ fetches the PR's **unresolved comments**, and opens a TUI:
    `e` = write your own instruction ("do this but use a builder instead",
    "just add a TODO"), `x` = ignore.
 3. **Run** — `r` launches one Claude Code agent run that implements every
-   instructed comment, **editing your checkout in place**. The TUI streams
-   the agent's thinking, tool calls, and output live.
-4. **Review in your IDE** — when it's done, the changes are ordinary
-   uncommitted edits in your working tree. `git diff`, tweak, commit, push —
-   all yours. trpr never commits, never pushes, never posts to GitHub.
+   instructed comment, **editing your checkout in place and committing one
+   commit per handled comment**. The TUI streams the agent's thinking, tool
+   calls, and output live.
+4. **Review, then push** — when it's done, the commits are on your branch.
+   `git log` / `git show` them, drop or reword what you don't like, then
+   push yourself. trpr never pushes and never posts to GitHub.
+
+Each commit carries structured trailers naming the comment it addresses:
+
+```
+review: rename to select_block_header_commitments_from_block
+
+Addresses: https://github.com/owner/repo/pull/176#discussion_r38264394
+Resolution: implemented as stated
+```
+
+These trailers are trpr's cross-session memory: next launch, it scans branch
+history and badges comments that already have a commit (`✔`), flags ones
+with a **new reply since that commit** (`↺`), and feeds the prior commit sha
+to the agent when you instruct a follow-up.
 
 ## Safety model
 
@@ -29,16 +44,21 @@ fetches the PR's **unresolved comments**, and opens a TUI:
   with read-only permissions — it cannot push, comment, or merge via the
   API even if a malicious comment tries to steer it.
 - **Deny rules.** Each run carries Claude Code permission rules denying
-  `git commit`, `git push`, and every `gh` write subcommand.
+  `git push`, history rewriting (`--amend`, `rebase`, `reset`), `git remote`,
+  and every `gh` write subcommand. Local commits are allowed — they're
+  reversible and publish nothing; *push* is the gate, and it stays yours.
+- **Clean tree required.** trpr refuses to start on a dirty working tree, so
+  every commit the agent makes is fully attributable to it.
 - **Your instructions are the authority.** The prompt tells the agent that
   comment bodies are untrusted third-party text and your per-comment
   instructions override them.
-- **Human gate.** Everything ends as uncommitted changes you review before
-  anything reaches GitHub.
+- **Human gate.** Everything ends as local commits you review before
+  anything reaches GitHub — you push.
 
 Note: because the agent runs in your real checkout, treat the deny rules +
-read-only token as the guardrails and review the diff before pushing — same
-discipline as reviewing any contributor's PR.
+read-only token as the guardrails and review the commits (messages included —
+they're agent output too) before pushing, same discipline as reviewing any
+contributor's PR.
 
 ## Requirements
 
@@ -87,9 +107,9 @@ focus (Tab toggles list ↔ detail).
 | Running | `q` abort (kills the agent) · `j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u` scroll |
 | Done | `q` quit · scroll as above |
 
-If your working tree has uncommitted changes, trpr warns in the header and
-asks for confirmation before starting a run (agent edits would mix with
-yours in `git diff`).
+List glyphs: `·` pending · `✓` instructed · `✗` ignored · `✔` committed in
+an earlier run · `↺` committed earlier **but new reply since** · `!`
+previously ignored but new activity.
 
 ## Run artifacts
 
@@ -135,6 +155,11 @@ just build      # release build
 
 - The PR is found by matching your current branch against open PRs' head
   branches (works for same-repo and fork-headed PRs). No open PR → error.
-- trpr holds no state between invocations: every launch re-fetches the
-  PR's comments fresh. Resolve handled threads on GitHub (or re-`x` them)
-  to keep the list short.
+- Comments are re-fetched fresh every launch. Cross-session memory comes
+  from two places: **`Addresses:` trailers in branch commits** (handled
+  comments — survives re-clones, visible to reviewers, robust to squashing
+  until merge) and **`ignored.json`** in the PR's data dir (ignored
+  comments — the one decision that produces no commit). Ignores auto-expire
+  when a thread gets new activity, resurfacing as `!`.
+- Resolving handled threads on GitHub remains the way to shrink the list
+  permanently — trpr can't resolve them for you (read-only token).

@@ -36,7 +36,11 @@ pub struct CommentItem {
     /// Follow-up comments in the thread: (author, body).
     pub replies: Vec<(String, String)>,
     pub diff_hunk: Option<String>,
+    /// The first comment's permalink — the stable key used in `Addresses:`
+    /// commit trailers and the ignored-comments file.
     pub url: String,
+    /// Newest activity in the thread (epoch seconds); 0 when unknown.
+    pub last_activity: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -147,7 +151,7 @@ impl Gh {
                       path
                       line
                       comments(first: 50) {
-                        nodes { author { login } body url diffHunk }
+                        nodes { author { login } body url diffHunk createdAt }
                       }
                     }
                   }
@@ -212,6 +216,11 @@ impl Gh {
                 replies,
                 diff_hunk: first["diffHunk"].as_str().map(|s| s.to_string()),
                 url: first["url"].as_str().unwrap_or("").to_string(),
+                last_activity: comments
+                    .iter()
+                    .filter_map(|c| parse_epoch(c["createdAt"].as_str()?))
+                    .max()
+                    .unwrap_or(0),
             });
         }
         Ok(out)
@@ -229,6 +238,8 @@ impl Gh {
             user: User,
             body: String,
             html_url: String,
+            #[serde(default)]
+            created_at: Option<String>,
         }
         let url = format!("{API}/repos/{repo}/issues/{pr}/comments?per_page=100");
         let comments: Vec<IssueComment> = self.get_json(&url).await?;
@@ -242,7 +253,14 @@ impl Gh {
                 replies: Vec::new(),
                 diff_hunk: None,
                 url: c.html_url,
+                last_activity: c.created_at.as_deref().and_then(parse_epoch).unwrap_or(0),
             })
             .collect())
     }
+}
+
+fn parse_epoch(iso: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|d| d.timestamp())
 }

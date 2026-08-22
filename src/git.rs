@@ -52,6 +52,36 @@ pub fn discover(dir: &Path) -> Result<GitCtx> {
     })
 }
 
+/// Scan branch history for `Addresses: <url>` trailers left by earlier trpr
+/// runs. Returns comment-url → (short sha, commit epoch) for the *newest*
+/// commit addressing each comment. Tolerant: any git failure yields an empty
+/// map (badges are hints, not correctness).
+pub fn addressed_commits(root: &Path) -> std::collections::HashMap<String, (String, i64)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(log) = git(root, &["log", "--format=%h %ct%n%B%x1e", "-n", "1000"]) else {
+        return out;
+    };
+    for record in log.split('\u{1e}') {
+        let mut lines = record.trim().lines();
+        let Some(head) = lines.next() else { continue };
+        let mut parts = head.split_whitespace();
+        let (Some(sha), Some(epoch)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(epoch) = epoch.parse::<i64>() else {
+            continue;
+        };
+        for line in lines {
+            if let Some(url) = line.trim().strip_prefix("Addresses:") {
+                // git log is newest-first; keep the first (newest) sighting.
+                out.entry(url.trim().to_string())
+                    .or_insert_with(|| (sha.to_string(), epoch));
+            }
+        }
+    }
+    out
+}
+
 pub fn parse_github_remote(url: &str) -> Option<String> {
     let u = url.trim();
     let rest = u

@@ -36,6 +36,10 @@ pub enum Decision {
 pub struct UiItem {
     pub item: CommentItem,
     pub decision: Decision,
+    /// A prior run already committed for this comment: (short sha, epoch).
+    pub handled: Option<(String, i64)>,
+    /// Epoch at which this comment was previously ignored, if ever.
+    pub prior_ignored: Option<i64>,
 }
 
 pub enum Phase {
@@ -44,7 +48,6 @@ pub enum Phase {
     Edit {
         buffer: String,
     },
-    ConfirmDirty,
     Running,
     Done {
         ok: bool,
@@ -58,8 +61,9 @@ pub struct App {
     pub branch: String,
     pub pr_number: u64,
     pub pr_title: String,
-    pub dirty: bool,
     pub items: Vec<UiItem>,
+    /// Persisted ignore decisions: comment url → epoch when ignored.
+    pub ignored_at: std::collections::HashMap<String, i64>,
     pub selected: usize,
     /// Which pane j/k act on in the Select phase.
     pub focus: Focus,
@@ -78,29 +82,44 @@ pub struct App {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo: String,
         repo_root: PathBuf,
         branch: String,
         pr_number: u64,
         pr_title: String,
-        dirty: bool,
         items: Vec<CommentItem>,
+        handled: std::collections::HashMap<String, (String, i64)>,
+        ignored_at: std::collections::HashMap<String, i64>,
     ) -> Self {
+        let items = items
+            .into_iter()
+            .map(|item| {
+                let handled_info = handled.get(&item.url).cloned();
+                let prior_ignored = ignored_at.get(&item.url).copied();
+                // A persisted ignore holds unless someone commented since —
+                // new activity resurfaces the item as Pending with a badge.
+                let decision = match prior_ignored {
+                    Some(ts) if item.last_activity <= ts => Decision::Ignored,
+                    _ => Decision::Pending,
+                };
+                UiItem {
+                    item,
+                    decision,
+                    handled: handled_info,
+                    prior_ignored,
+                }
+            })
+            .collect();
         Self {
             repo,
             repo_root,
             branch,
             pr_number,
             pr_title,
-            dirty,
-            items: items
-                .into_iter()
-                .map(|item| UiItem {
-                    item,
-                    decision: Decision::Pending,
-                })
-                .collect(),
+            items,
+            ignored_at,
             selected: 0,
             focus: Focus::List,
             detail_scroll: 0,
@@ -137,7 +156,7 @@ pub async fn run(mut app: App, actx: AppCtx) -> Result<()> {
     if let Some(dir) = &app.run_dir {
         println!("Run artifacts: {}", dir.display());
         println!(
-            "Agent changes (if any) are uncommitted in {}",
+            "Agent commits (if any) are on your branch in {} — review with `git log`, then push yourself.",
             app.repo_root.display()
         );
     }
@@ -342,11 +361,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
             }
             KeyCode::Char('x') => {
                 if let Some(item) = app.items.get_mut(app.selected) {
-                    item.decision = if item.decision == Decision::Ignored {
-                        Decision::Pending
+                    let url = item.item.url.clone();
+                    if item.decision == Decision::Ignored {
+                        item.decision = Decision::Pending;
+                        app.ignored_at.remove(&url);
                     } else {
-                        Decision::Ignored
-                    };
+                        item.decision = Decision::Ignored;
+                        app.ignored_at.insert(url, chrono::Utc::now().timestamp());
+                    }
+                    save_ignored(app); // best-effort persistence
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') => {
@@ -362,8 +385,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
                 if app.instructed_count() == 0 {
                     app.notice =
                         Some("nothing to do — instruct at least one comment (a or e)".into());
-                } else if app.dirty {
-                    app.phase = Phase::ConfirmDirty;
                 } else {
                     return Flow::StartRun;
                 }
@@ -390,10 +411,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
             }
             KeyCode::Char(c) => buffer.push(c),
             _ => {}
-        },
-        Phase::ConfirmDirty => match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => return Flow::StartRun,
-            _ => app.phase = Phase::Select,
         },
         Phase::Running => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Flow::Abort,
@@ -445,15 +462,41 @@ fn data_dir() -> Result<PathBuf> {
     Ok(home.join(".trpr"))
 }
 
+fn pr_dir(repo: &str, pr_number: u64) -> Result<PathBuf> {
+    Ok(data_dir()?
+        .join("runs")
+        .join(repo.replace('/', "__"))
+        .join(format!("pr-{pr_number}")))
+}
+
+/// Persisted ignore decisions (comment url → epoch ignored). Ignores are the
+/// one triage decision git can't carry — no change means no commit — so they
+/// get a small per-PR file instead.
+pub fn load_ignored(repo: &str, pr_number: u64) -> std::collections::HashMap<String, i64> {
+    pr_dir(repo, pr_number)
+        .ok()
+        .and_then(|d| std::fs::read_to_string(d.join("ignored.json")).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort save; losing this file costs badges, not correctness.
+fn save_ignored(app: &App) {
+    let Ok(dir) = pr_dir(&app.repo, app.pr_number) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(json) = serde_json::to_string_pretty(&app.ignored_at) {
+        let _ = std::fs::write(dir.join("ignored.json"), json);
+    }
+}
+
 /// <data-dir>/runs/<owner>__<repo>/pr-<n>/<timestamp> — repo dimension is
 /// explicit now that all repos share one tree. Returned absolute, since the
 /// agent needs it as an additional writable directory outside its cwd.
 fn prepare_run_dir(repo: &str, pr_number: u64) -> Result<PathBuf> {
-    let run_dir = data_dir()?
-        .join("runs")
-        .join(repo.replace('/', "__"))
-        .join(format!("pr-{pr_number}"))
-        .join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string());
+    let run_dir =
+        pr_dir(repo, pr_number)?.join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string());
     std::fs::create_dir_all(&run_dir)?;
     Ok(std::fs::canonicalize(&run_dir)?)
 }
@@ -485,6 +528,7 @@ fn items_json(items: &[UiItem]) -> String {
                     .collect::<Vec<_>>(),
                 "diff_hunk": ui.item.diff_hunk,
                 "url": ui.item.url,
+                "previously_committed": ui.handled.as_ref().map(|(sha, _)| sha.clone()),
                 "developer_instruction": instruction,
             }))
         })
@@ -504,18 +548,13 @@ fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, header);
     match &app.phase {
-        Phase::Select | Phase::Edit { .. } | Phase::ConfirmDirty => {
-            draw_select(f, app, main);
-        }
+        Phase::Select | Phase::Edit { .. } => draw_select(f, app, main),
         Phase::Running | Phase::Done { .. } => draw_log(f, app, main),
     }
     draw_footer(f, app, footer);
 
     if let Phase::Edit { buffer } = &app.phase {
         draw_edit_popup(f, buffer, f.area());
-    }
-    if matches!(app.phase, Phase::ConfirmDirty) {
-        draw_confirm_popup(f, f.area());
     }
 }
 
@@ -530,12 +569,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             app.repo, app.pr_number, app.pr_title, app.branch
         )),
     ])];
-    if app.dirty {
-        lines.push(Line::styled(
-            "⚠ working tree has uncommitted changes — agent edits will mix with them",
-            Style::new().fg(Color::Yellow),
-        ));
-    }
+    lines.push(Line::styled(
+        "agent commits per handled comment (Addresses: trailers) — you review, then push",
+        Style::new().fg(Color::DarkGray),
+    ));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -548,9 +585,19 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|ui| {
             let (glyph, style) = match &ui.decision {
-                Decision::Pending => ("· ", Style::new()),
-                Decision::Ignored => ("✗ ", Style::new().fg(Color::DarkGray)),
                 Decision::Instructed(_) => ("✓ ", Style::new().fg(Color::Green)),
+                Decision::Ignored => ("✗ ", Style::new().fg(Color::DarkGray)),
+                Decision::Pending => match &ui.handled {
+                    // Committed in an earlier run, but the thread has moved on.
+                    Some((_, t)) if ui.item.last_activity > *t => {
+                        ("↺ ", Style::new().fg(Color::Yellow))
+                    }
+                    // Committed in an earlier run, nothing new since.
+                    Some(_) => ("✔ ", Style::new().fg(Color::DarkGray)),
+                    // Previously ignored, but there's new activity.
+                    None if ui.prior_ignored.is_some() => ("! ", Style::new().fg(Color::Yellow)),
+                    None => ("· ", Style::new()),
+                },
             };
             ListItem::new(Line::styled(format!("{glyph}{}", ui.item.label()), style))
         })
@@ -598,6 +645,22 @@ fn detail_text(ui: &UiItem) -> Text<'static> {
         format!("@{} — {}", ui.item.author, ui.item.url),
         Style::new().fg(Color::DarkGray),
     ));
+    if let Some((sha, t)) = &ui.handled {
+        let suffix = if ui.item.last_activity > *t {
+            " — NEW REPLY since that commit"
+        } else {
+            ""
+        };
+        lines.push(Line::styled(
+            format!("previously committed in {sha}{suffix}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    } else if ui.prior_ignored.is_some() && ui.decision == Decision::Pending {
+        lines.push(Line::styled(
+            "previously ignored — resurfaced due to new activity".to_string(),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     if let Some(hunk) = &ui.item.diff_hunk {
         for l in hunk
             .lines()
@@ -691,7 +754,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Phase::Edit { .. } => lines.push(Line::raw(
             "Enter save · Alt+Enter newline · Esc cancel",
         )),
-        Phase::ConfirmDirty => lines.push(Line::raw("y start anyway · any other key: back")),
         Phase::Running => {
             let elapsed = app.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let quiet = app.last_event.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -712,7 +774,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::styled(
                 format!(
                     "{} — {} · q quit",
-                    if *ok { "done — changes are uncommitted in your tree" } else { "failed" },
+                    if *ok {
+                        "done — commits are on your branch (review, then push yourself)"
+                    } else {
+                        "failed — check git log/status for partial work"
+                    },
                     crate::agent::truncate(summary, 120)
                 ),
                 style,
@@ -740,19 +806,6 @@ fn draw_edit_popup(f: &mut Frame, buffer: &str, area: Rect) {
         Paragraph::new(text)
             .block(Block::bordered().title("instruction for the agent"))
             .wrap(Wrap { trim: false }),
-        popup,
-    );
-}
-
-fn draw_confirm_popup(f: &mut Frame, area: Rect) {
-    let popup = centered(area, 60, 5);
-    f.render_widget(Clear, popup);
-    f.render_widget(
-        Paragraph::new(
-            "Working tree has uncommitted changes.\nAgent edits will mix with them in git diff.\nStart anyway? (y/n)",
-        )
-        .block(Block::bordered().title("dirty working tree"))
-        .wrap(Wrap { trim: false }),
         popup,
     );
 }
