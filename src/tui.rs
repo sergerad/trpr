@@ -2,7 +2,7 @@
 //! agent, watch it work.
 
 use crate::agent::{self, RunCtx, RunEvent, Step, StepKind};
-use crate::github::{CommentItem, ItemKind};
+use crate::github::{CommentItem, ItemKind, PrSummary};
 use anyhow::{Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -79,6 +79,8 @@ pub struct App {
     pub run_started: Option<Instant>,
     pub last_event: Option<Instant>,
     pub run_dir: Option<PathBuf>,
+    /// Launched from the PR-list screen: Esc navigates back instead of quitting.
+    pub from_list: bool,
 }
 
 impl App {
@@ -131,6 +133,7 @@ impl App {
             run_started: None,
             last_event: None,
             run_dir: None,
+            from_list: false,
         }
     }
 
@@ -145,116 +148,393 @@ impl App {
 enum Flow {
     Continue,
     Quit,
+    Back,
     StartRun,
     Abort,
 }
 
-pub async fn run(mut app: App, actx: AppCtx) -> Result<()> {
-    let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, &mut app, &actx).await;
-    ratatui::restore();
-    if let Some(dir) = &app.run_dir {
-        println!("Run artifacts: {}", dir.display());
-        println!(
-            "Agent commits (if any) are on your branch in {} — review with `git log`, then push yourself.",
-            app.repo_root.display()
-        );
-    }
-    result
+/// How the comment view ended.
+pub enum CommentExit {
+    Quit,
+    BackToList,
 }
 
-async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    actx: &AppCtx,
-) -> Result<()> {
-    // Blocking key reader thread bridged into the async loop.
-    let (key_tx, mut key_rx) = unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
-            if key_tx.send(ev).is_err() {
-                break;
-            }
-        }
-    });
+/// What the PR-list screen resolved to.
+pub enum PickOutcome {
+    Quit,
+    Refresh,
+    Pr(PrSummary),
+    /// Ctrl-i / Tab: resume the most recently left comment view, state intact.
+    Forward,
+}
 
-    let mut agent_rx: Option<UnboundedReceiver<RunEvent>> = None;
-    let mut abort_tx: Option<UnboundedSender<()>> = None;
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+/// One terminal + one key-reader thread for the whole program, hosting both
+/// screens (PR list, comment view) so they can hand off to each other.
+pub struct Session {
+    terminal: ratatui::DefaultTerminal,
+    key_rx: UnboundedReceiver<Event>,
+}
 
-    loop {
-        terminal.draw(|f| draw(f, app))?;
-
-        enum Ev {
-            Key(Event),
-            Agent(RunEvent),
-            Tick,
-        }
-        let ev = tokio::select! {
-            Some(k) = key_rx.recv() => Ev::Key(k),
-            r = recv_opt(&mut agent_rx) => match r {
-                Some(x) => Ev::Agent(x),
-                None => { agent_rx = None; Ev::Tick }
-            },
-            _ = tick.tick() => Ev::Tick,
-        };
-
-        match ev {
-            Ev::Tick => {}
-            Ev::Agent(RunEvent::Step(step)) => {
-                app.log.push(step);
-                app.last_event = Some(Instant::now());
-            }
-            Ev::Agent(RunEvent::Finished { ok, summary }) => {
-                app.phase = Phase::Done { ok, summary };
-                agent_rx = None;
-                abort_tx = None;
-            }
-            Ev::Key(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                app.notice = None;
-                match handle_key(app, key) {
-                    Flow::Quit => {
-                        if let Some(tx) = &abort_tx {
-                            let _ = tx.send(());
-                        }
-                        return Ok(());
-                    }
-                    Flow::Abort => {
-                        if let Some(tx) = &abort_tx {
-                            let _ = tx.send(());
-                            app.notice = Some("aborting…".into());
-                        }
-                    }
-                    Flow::StartRun => {
-                        let (tx, rx) = unbounded_channel();
-                        let (atx, arx) = unbounded_channel();
-                        let run_dir = prepare_run_dir(&app.repo, app.pr_number)?;
-                        let ctx = RunCtx {
-                            repo_root: app.repo_root.clone(),
-                            repo: app.repo.clone(),
-                            pr_number: app.pr_number,
-                            pr_title: app.pr_title.clone(),
-                            branch: app.branch.clone(),
-                            items_json: items_json(&app.items),
-                            claude_bin: actx.claude_bin.clone(),
-                            max_turns: actx.max_turns,
-                            github_token: actx.token.clone(),
-                            run_dir: run_dir.clone(),
-                        };
-                        app.run_dir = Some(run_dir);
-                        app.phase = Phase::Running;
-                        app.run_started = Some(Instant::now());
-                        app.last_event = Some(Instant::now());
-                        app.log.clear();
-                        app.log_offset = 0;
-                        agent_rx = Some(rx);
-                        abort_tx = Some(atx);
-                        tokio::spawn(agent::run_agent(ctx, tx, arx));
-                    }
-                    Flow::Continue => {}
+impl Session {
+    pub fn new() -> Self {
+        let terminal = ratatui::init();
+        let (key_tx, key_rx) = unbounded_channel::<Event>();
+        std::thread::spawn(move || {
+            while let Ok(ev) = crossterm::event::read() {
+                if key_tx.send(ev).is_err() {
+                    break;
                 }
             }
-            Ev::Key(_) => {}
+        });
+        Self { terminal, key_rx }
+    }
+
+    pub fn close(self) {
+        ratatui::restore();
+    }
+
+    /// Draw a one-off centered message (e.g. "fetching…") while the caller
+    /// awaits something; no input handling.
+    pub fn show_message(&mut self, msg: &str) -> Result<()> {
+        self.terminal.draw(|f| {
+            let popup = centered(f.area(), 60, 3);
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(msg.to_string()).block(Block::bordered()),
+                popup,
+            );
+        })?;
+        Ok(())
+    }
+
+    /// The PR-list screen. `last_runs`: pr number → epoch of the newest trpr
+    /// run, for the NEW-since-last-run indicator.
+    pub async fn pick_pr(
+        &mut self,
+        repo: &str,
+        current_branch: &str,
+        summaries: &[PrSummary],
+        last_runs: &std::collections::HashMap<u64, i64>,
+        notice: Option<&str>,
+        can_forward: bool,
+    ) -> Result<PickOutcome> {
+        let mut selected = 0usize;
+        let mut pending_g = false;
+        loop {
+            self.terminal.draw(|f| {
+                draw_pr_list(
+                    f,
+                    repo,
+                    current_branch,
+                    summaries,
+                    last_runs,
+                    selected,
+                    notice,
+                    can_forward,
+                )
+            })?;
+            let Some(ev) = self.key_rx.recv().await else {
+                return Ok(PickOutcome::Quit);
+            };
+            let Event::Key(key) = ev else { continue };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let was_pending_g = std::mem::take(&mut pending_g);
+            let max = summaries.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(PickOutcome::Quit),
+                KeyCode::Char('r') => return Ok(PickOutcome::Refresh),
+                // Ctrl-i is Tab in most terminals (both 0x09) — accept either
+                // as vim-style "forward" back into the last comment view.
+                KeyCode::Tab if can_forward => return Ok(PickOutcome::Forward),
+                KeyCode::Char('i')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) && can_forward =>
+                {
+                    return Ok(PickOutcome::Forward)
+                }
+                KeyCode::Enter => {
+                    if let Some(s) = summaries.get(selected) {
+                        return Ok(PickOutcome::Pr(s.clone()));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1).min(max),
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    selected = (selected + 10).min(max)
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    selected = selected.saturating_sub(10)
+                }
+                KeyCode::Char('g') => {
+                    if was_pending_g {
+                        selected = 0;
+                    } else {
+                        pending_g = true;
+                    }
+                }
+                KeyCode::Char('G') => selected = max,
+                _ => {}
+            }
+        }
+    }
+
+    /// The comment view (select → instruct → run → done).
+    pub async fn run_comments(&mut self, app: &mut App, actx: &AppCtx) -> Result<CommentExit> {
+        let mut agent_rx: Option<UnboundedReceiver<RunEvent>> = None;
+        let mut abort_tx: Option<UnboundedSender<()>> = None;
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+
+        loop {
+            self.terminal.draw(|f| draw(f, app))?;
+
+            enum Ev {
+                Key(Event),
+                Agent(RunEvent),
+                Tick,
+            }
+            let ev = tokio::select! {
+                Some(k) = self.key_rx.recv() => Ev::Key(k),
+                r = recv_opt(&mut agent_rx) => match r {
+                    Some(x) => Ev::Agent(x),
+                    None => { agent_rx = None; Ev::Tick }
+                },
+                _ = tick.tick() => Ev::Tick,
+            };
+
+            match ev {
+                Ev::Tick => {}
+                Ev::Agent(RunEvent::Step(step)) => {
+                    app.log.push(step);
+                    app.last_event = Some(Instant::now());
+                }
+                Ev::Agent(RunEvent::Finished { ok, summary }) => {
+                    app.phase = Phase::Done { ok, summary };
+                    agent_rx = None;
+                    abort_tx = None;
+                }
+                Ev::Key(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    app.notice = None;
+                    match handle_key(app, key) {
+                        Flow::Quit => {
+                            if let Some(tx) = &abort_tx {
+                                let _ = tx.send(());
+                            }
+                            return Ok(CommentExit::Quit);
+                        }
+                        Flow::Back => {
+                            if let Some(tx) = &abort_tx {
+                                let _ = tx.send(());
+                            }
+                            return Ok(CommentExit::BackToList);
+                        }
+                        Flow::Abort => {
+                            if let Some(tx) = &abort_tx {
+                                let _ = tx.send(());
+                                app.notice = Some("aborting…".into());
+                            }
+                        }
+                        Flow::StartRun => {
+                            let (tx, rx) = unbounded_channel();
+                            let (atx, arx) = unbounded_channel();
+                            let run_dir = prepare_run_dir(&app.repo, app.pr_number)?;
+                            let ctx = RunCtx {
+                                repo_root: app.repo_root.clone(),
+                                repo: app.repo.clone(),
+                                pr_number: app.pr_number,
+                                pr_title: app.pr_title.clone(),
+                                branch: app.branch.clone(),
+                                items_json: items_json(&app.items),
+                                claude_bin: actx.claude_bin.clone(),
+                                max_turns: actx.max_turns,
+                                github_token: actx.token.clone(),
+                                run_dir: run_dir.clone(),
+                            };
+                            app.run_dir = Some(run_dir);
+                            app.phase = Phase::Running;
+                            app.run_started = Some(Instant::now());
+                            app.last_event = Some(Instant::now());
+                            app.log.clear();
+                            app.log_offset = 0;
+                            agent_rx = Some(rx);
+                            abort_tx = Some(atx);
+                            tokio::spawn(agent::run_agent(ctx, tx, arx));
+                        }
+                        Flow::Continue => {}
+                    }
+                }
+                Ev::Key(_) => {}
+            }
+        }
+    }
+}
+
+/// Newest run timestamp per PR for this repo, from the run-dir mtimes.
+pub fn last_run_times(repo: &str) -> std::collections::HashMap<u64, i64> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(base) = data_dir() else { return out };
+    let repo_dir = base.join("runs").join(repo.replace('/', "__"));
+    let Ok(entries) = std::fs::read_dir(&repo_dir) else {
+        return out;
+    };
+    for pr_entry in entries.flatten() {
+        let name = pr_entry.file_name().to_string_lossy().to_string();
+        let Some(num) = name.strip_prefix("pr-").and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Ok(runs) = std::fs::read_dir(pr_entry.path()) else {
+            continue;
+        };
+        let newest = runs
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.metadata().ok()?.modified().ok())
+            .filter_map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+            })
+            .max();
+        if let Some(ts) = newest {
+            out.insert(num, ts);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pr_list(
+    f: &mut Frame,
+    repo: &str,
+    current_branch: &str,
+    summaries: &[PrSummary],
+    last_runs: &std::collections::HashMap<u64, i64>,
+    selected: usize,
+    notice: Option<&str>,
+    can_forward: bool,
+) {
+    let [header, main, footer] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(3),
+        Constraint::Length(2),
+    ])
+    .areas(f.area());
+
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "trpr ",
+                    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{repo} — open PRs (current branch: {current_branch})")),
+            ]),
+            Line::styled(
+                "select a PR to triage its comments — selecting another branch switches your checkout",
+                Style::new().fg(Color::DarkGray),
+            ),
+        ]),
+        header,
+    );
+
+    // Content-sized columns (clamped), with the title taking all remaining
+    // width and padded to it — so every column aligns exactly and each row
+    // spans the full box (making the highlight bar full-width too). `fit`
+    // guarantees exact widths; naive truncation drifted by the '…' char.
+    let inner_w = main.width.saturating_sub(2) as usize;
+    let num_w = summaries
+        .iter()
+        .map(|s| s.number.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let branch_w = summaries
+        .iter()
+        .map(|s| s.branch.chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 32);
+    let author_w = summaries
+        .iter()
+        .map(|s| s.author.chars().count() + 1) // "@" prefix
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 16);
+    let open_w = summaries
+        .iter()
+        .map(|s| s.unresolved.to_string().len())
+        .max()
+        .unwrap_or(1)
+        .max(2);
+    const BADGE_W: usize = 22; // "no news since last run"
+    let fixed = 2 + 1 + num_w + 1 + branch_w + 1 + author_w + 1 + open_w + 5 + 2 + BADGE_W + 2;
+    let title_w = inner_w.saturating_sub(fixed).max(8);
+
+    let rows: Vec<ListItem> = summaries
+        .iter()
+        .map(|s| {
+            let (badge, badge_style) = match last_runs.get(&s.number) {
+                Some(t) if s.last_activity > *t => {
+                    ("NEW since last run", Style::new().fg(Color::Yellow))
+                }
+                Some(_) => ("no news since last run", Style::new().fg(Color::DarkGray)),
+                None => ("never run", Style::new().fg(Color::DarkGray)),
+            };
+            let current = if s.branch == current_branch {
+                "▶"
+            } else {
+                " "
+            };
+            let main_style = if s.branch == current_branch {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{current} #{:<num_w$} {} {} {:>open_w$} open  ",
+                        s.number,
+                        fit(&s.branch, branch_w),
+                        fit(&format!("@{}", s.author), author_w),
+                        s.unresolved,
+                    ),
+                    main_style,
+                ),
+                Span::styled(fit(badge, BADGE_W), badge_style),
+                Span::styled(format!("  {}", fit(&s.title, title_w)), main_style),
+            ]))
+        })
+        .collect();
+    let list = List::new(rows)
+        .block(Block::bordered().title(format!("{} open PR(s)", summaries.len())))
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default();
+    state.select(Some(selected.min(summaries.len().saturating_sub(1))));
+    f.render_stateful_widget(list, main, &mut state);
+
+    let mut help =
+        "j/k move · gg/G top/bottom · ^d/^u jump · Enter open · r refresh · q quit".to_string();
+    if can_forward {
+        help.push_str(" · ^i/Tab resume last view");
+    }
+    let mut lines = vec![Line::raw(help)];
+    if let Some(n) = notice {
+        lines.push(Line::styled(n.to_string(), Style::new().fg(Color::Yellow)));
+    }
+    f.render_widget(Paragraph::new(lines), footer);
+}
+
+/// Pad or truncate to exactly `w` display columns (char-counted): the
+/// building block for aligned table rows. Truncation ends in '…'.
+fn fit(s: &str, w: usize) -> String {
+    let count = s.chars().count();
+    match count.cmp(&w) {
+        std::cmp::Ordering::Equal => s.to_string(),
+        std::cmp::Ordering::Less => format!("{s}{}", " ".repeat(w - count)),
+        std::cmp::Ordering::Greater => {
+            let mut t: String = s.chars().take(w.saturating_sub(1)).collect();
+            t.push('…');
+            t
         }
     }
 }
@@ -285,7 +565,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
     let pending_g = std::mem::take(&mut app.pending_g);
     match &mut app.phase {
         Phase::Select => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Esc => {
+                return if app.from_list {
+                    Flow::Back
+                } else {
+                    Flow::Quit
+                };
+            }
+            // vim-style jump back to the PR list (list mode only; ^i/Tab on
+            // the list then resumes this view with its state intact).
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.from_list {
+                    return Flow::Back;
+                }
+            }
             KeyCode::Tab => {
                 app.focus = match app.focus {
                     Focus::List => Focus::Detail,
@@ -364,10 +658,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
                     let url = item.item.url.clone();
                     if item.decision == Decision::Ignored {
                         item.decision = Decision::Pending;
+                        // A deliberate un-ignore clears the marker entirely —
+                        // otherwise the stale timestamp masquerades as a
+                        // "resurfaced" badge.
+                        item.prior_ignored = None;
                         app.ignored_at.remove(&url);
                     } else {
+                        let now = chrono::Utc::now().timestamp();
                         item.decision = Decision::Ignored;
-                        app.ignored_at.insert(url, chrono::Utc::now().timestamp());
+                        item.prior_ignored = Some(now);
+                        app.ignored_at.insert(url, now);
                     }
                     save_ignored(app); // best-effort persistence
                 }
@@ -417,7 +717,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
             other => log_scroll_key(app, other, key.modifiers, pending_g),
         },
         Phase::Done { .. } => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Flow::Quit,
+            KeyCode::Char('q') => return Flow::Quit,
+            KeyCode::Esc => {
+                return if app.from_list {
+                    Flow::Back
+                } else {
+                    Flow::Quit
+                };
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if app.from_list {
+                    return Flow::Back;
+                }
+            }
             other => log_scroll_key(app, other, key.modifiers, pending_g),
         },
     }
@@ -594,8 +906,13 @@ fn draw_select(f: &mut Frame, app: &App, area: Rect) {
                     }
                     // Committed in an earlier run, nothing new since.
                     Some(_) => ("✔ ", Style::new().fg(Color::DarkGray)),
-                    // Previously ignored, but there's new activity.
-                    None if ui.prior_ignored.is_some() => ("! ", Style::new().fg(Color::Yellow)),
+                    // Previously ignored, and there's genuinely new activity.
+                    None if ui
+                        .prior_ignored
+                        .is_some_and(|ts| ui.item.last_activity > ts) =>
+                    {
+                        ("! ", Style::new().fg(Color::Yellow))
+                    }
                     None => ("· ", Style::new()),
                 },
             };
@@ -655,7 +972,11 @@ fn detail_text(ui: &UiItem) -> Text<'static> {
             format!("previously committed in {sha}{suffix}"),
             Style::new().fg(Color::Yellow),
         ));
-    } else if ui.prior_ignored.is_some() && ui.decision == Decision::Pending {
+    } else if ui.decision == Decision::Pending
+        && ui
+            .prior_ignored
+            .is_some_and(|ts| ui.item.last_activity > ts)
+    {
         lines.push(Line::styled(
             "previously ignored — resurfaced due to new activity".to_string(),
             Style::new().fg(Color::Yellow),
@@ -743,17 +1064,22 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     match &app.phase {
-        Phase::Select => lines.push(Line::raw(match app.focus {
-            Focus::List => {
-                "j/k move · gg/G top/bot · ^d/^u jump · Tab→detail · a as-stated · e edit · x ignore · r run · q quit"
+        Phase::Select => {
+            let mut help = match app.focus {
+                Focus::List => {
+                    "j/k move · gg/G top/bot · ^d/^u jump · Tab→detail · a as-stated · e edit · x ignore · r run · q quit"
+                }
+                Focus::Detail => {
+                    "j/k scroll · gg/G top/bot · ^d/^u jump · Tab→list · a as-stated · e edit · x ignore · r run · q quit"
+                }
             }
-            Focus::Detail => {
-                "j/k scroll · gg/G top/bot · ^d/^u jump · Tab→list · a as-stated · e edit · x ignore · r run · q quit"
+            .to_string();
+            if app.from_list {
+                help.push_str(" · ^o PR list");
             }
-        })),
-        Phase::Edit { .. } => lines.push(Line::raw(
-            "Enter save · Alt+Enter newline · Esc cancel",
-        )),
+            lines.push(Line::raw(help));
+        }
+        Phase::Edit { .. } => lines.push(Line::raw("Enter save · Alt+Enter newline · Esc cancel")),
         Phase::Running => {
             let elapsed = app.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
             let quiet = app.last_event.map(|t| t.elapsed().as_secs()).unwrap_or(0);

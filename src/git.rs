@@ -52,6 +52,34 @@ pub fn discover(dir: &Path) -> Result<GitCtx> {
     })
 }
 
+/// Switch the checkout to `branch`, fetching and creating a tracking branch
+/// from origin when it doesn't exist locally. Callers guarantee a clean tree
+/// (enforced at startup), so switching is non-destructive.
+pub fn switch_branch(root: &Path, branch: &str) -> Result<()> {
+    let local_exists = git(
+        root,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok();
+    if local_exists {
+        git(root, &["switch", branch])?;
+    } else {
+        git(root, &["fetch", "origin", branch])
+            .with_context(|| format!("fetching origin/{branch}"))?;
+        git(
+            root,
+            &[
+                "switch",
+                "-c",
+                branch,
+                "--track",
+                &format!("origin/{branch}"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// Scan branch history for `Addresses: <url>` trailers left by earlier trpr
 /// runs. Returns comment-url → (short sha, commit epoch) for the *newest*
 /// commit addressing each comment. Tolerant: any git failure yields an empty

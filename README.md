@@ -4,12 +4,26 @@ Address PR review comments with a [Claude Code](https://claude.com/claude-code)
 agent — from inside your checkout, on your terms.
 
 ```sh
-cd ~/Source/miden-node        # your checkout, on the PR branch
-trpr                         # or: trpr ~/Source/miden-node
+cd ~/Source/miden-node
+trpr           # PR-list mode: browse the repo's open PRs, pick one to triage
+trpr .         # direct mode: straight to the PR of the checked-out branch
 ```
 
-trpr figures out which GitHub repo and PR your current branch belongs to,
-fetches the PR's **unresolved comments**, and opens a TUI:
+**PR-list mode** (bare `trpr`) shows every open PR with its branch, author,
+unresolved-comment count, and whether there's been **NEW activity since your
+last trpr run** on that PR (`never run` if there hasn't been one). Selecting
+a PR whose branch isn't checked out **switches your checkout to it** (safe —
+trpr requires a clean tree), then opens the comment view. `Ctrl-o` (or Esc)
+from the comment view jumps back to the list, and `Ctrl-i` (or Tab — same
+key in most terminals) on the list resumes the view you left **with your
+in-progress instructions intact**, vim-jumplist style. Enter on a PR always
+opens it fresh (re-fetches comments); opening a different PR clears the
+resume slot.
+
+**Direct mode** (`trpr <path>`, e.g. `trpr .`) skips the list and jumps to
+the PR of that checkout's current branch — errors out if there's no open PR.
+
+Either way you land in the comment view:
 
 1. **Select** — browse the comments (inline review threads + conversation-tab
    comments, bots filtered out).
@@ -102,10 +116,11 @@ focus (Tab toggles list ↔ detail).
 
 | Phase | Keys |
 |---|---|
-| Select | Tab toggle focus · `j`/`k` move/scroll · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `r` run · `q` quit |
+| PR list | `j`/`k` move · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · Enter open (switches branch if needed) · `Ctrl-i`/Tab resume the last-left comment view (state intact) · `r` refresh · `q`/Esc quit |
+| Select | Tab toggle focus · `j`/`k` move/scroll · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `r` run · `Ctrl-o`/Esc back to list (list mode) · `q` quit |
 | Instruction editor | Enter save · Alt+Enter newline · Esc cancel |
 | Running | `q` abort (kills the agent) · `j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u` scroll |
-| Done | `q` quit · scroll as above |
+| Done | Esc back to list (list mode) · `q` quit · scroll as above |
 
 List glyphs: `·` pending · `✓` instructed · `✗` ignored · `✔` committed in
 an earlier run · `↺` committed earlier **but new reply since** · `!`

@@ -25,6 +25,19 @@ pub struct Pr {
     pub html_url: String,
 }
 
+/// One row of the PR-list screen.
+#[derive(Debug, Clone)]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    pub branch: String,
+    pub author: String,
+    /// Unresolved review threads + conversation comments.
+    pub unresolved: usize,
+    /// Newest comment activity (epoch seconds); 0 when none/unknown.
+    pub last_activity: i64,
+}
+
 /// One reviewable item shown in the TUI: an unresolved inline review thread,
 /// or a conversation-tab comment.
 #[derive(Debug, Clone)]
@@ -130,6 +143,99 @@ impl Gh {
         Ok(prs.into_iter().find(|p| p.head.branch == branch))
     }
 
+    /// All open PRs with enough detail for the list screen, in one GraphQL
+    /// round-trip: unresolved-thread counts and latest comment activity.
+    pub async fn open_pr_summaries(&self, repo: &str) -> Result<Vec<PrSummary>> {
+        let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
+        let query = r#"
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                pullRequests(states: OPEN, first: 50,
+                             orderBy: {field: UPDATED_AT, direction: DESC}) {
+                  nodes {
+                    number
+                    title
+                    headRefName
+                    author { login }
+                    comments(last: 1) { totalCount nodes { createdAt } }
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        comments(last: 1) { nodes { createdAt } }
+                      }
+                    }
+                  }
+                }
+              }
+            }"#;
+        let v = self
+            .graphql(query, serde_json::json!({ "owner": owner, "name": name }))
+            .await?;
+
+        let mut out = Vec::new();
+        let nodes = v["data"]["repository"]["pullRequests"]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for pr in nodes {
+            let mut unresolved = 0usize;
+            let mut last_activity = 0i64;
+            for t in pr["reviewThreads"]["nodes"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+            {
+                if t["isResolved"].as_bool().unwrap_or(true) {
+                    continue;
+                }
+                unresolved += 1;
+                if let Some(ts) = t["comments"]["nodes"][0]["createdAt"]
+                    .as_str()
+                    .and_then(parse_epoch)
+                {
+                    last_activity = last_activity.max(ts);
+                }
+            }
+            unresolved += pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize;
+            if let Some(ts) = pr["comments"]["nodes"][0]["createdAt"]
+                .as_str()
+                .and_then(parse_epoch)
+            {
+                last_activity = last_activity.max(ts);
+            }
+            out.push(PrSummary {
+                number: pr["number"].as_u64().unwrap_or(0),
+                title: pr["title"].as_str().unwrap_or("").to_string(),
+                branch: pr["headRefName"].as_str().unwrap_or("").to_string(),
+                author: pr["author"]["login"].as_str().unwrap_or("?").to_string(),
+                unresolved,
+                last_activity,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn graphql(
+        &self,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .post(format!("{API}/graphql"))
+            .bearer_auth(&self.token)
+            .header("User-Agent", "trpr")
+            .json(&serde_json::json!({ "query": query, "variables": variables }))
+            .send()
+            .await
+            .context("POST /graphql")?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await.context("decoding graphql response")?;
+        if !status.is_success() || v["errors"].is_array() {
+            bail!("graphql query failed ({status}): {}", v["errors"]);
+        }
+        Ok(v)
+    }
+
     /// Unresolved inline review threads (GraphQL — REST doesn't expose
     /// resolved state) plus all conversation-tab comments. Bots excluded.
     pub async fn unresolved_items(&self, repo: &str, pr: u64) -> Result<Vec<CommentItem>> {
@@ -158,23 +264,12 @@ impl Gh {
                 }
               }
             }"#;
-        let resp = self
-            .http
-            .post(format!("{API}/graphql"))
-            .bearer_auth(&self.token)
-            .header("User-Agent", "trpr")
-            .json(&serde_json::json!({
-                "query": query,
-                "variables": { "owner": owner, "name": name, "number": pr },
-            }))
-            .send()
-            .await
-            .context("POST /graphql")?;
-        let status = resp.status();
-        let v: serde_json::Value = resp.json().await.context("decoding graphql response")?;
-        if !status.is_success() || v["errors"].is_array() {
-            bail!("graphql query failed ({status}): {}", v["errors"]);
-        }
+        let v = self
+            .graphql(
+                query,
+                serde_json::json!({ "owner": owner, "name": name, "number": pr }),
+            )
+            .await?;
 
         let mut out = Vec::new();
         let nodes = v["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
