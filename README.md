@@ -9,9 +9,12 @@ trpr           # PR-list mode: browse the repo's open PRs, pick one to triage
 trpr .         # direct mode: straight to the PR of the checked-out branch
 ```
 
-**PR-list mode** (bare `trpr`) shows every open PR with its branch, author,
-unresolved-comment count, and whether there's been **NEW activity since your
-last trpr run** on that PR (`never run` if there hasn't been one). Selecting
+**PR-list mode** (bare `trpr`) shows every open PR with its branch,
+triage owner, unresolved-comment count, and whether there's been **NEW
+activity since your last trpr run** on that PR (`never run` if there hasn't
+been one). Rows are grouped by triage owner — the assignee, or the author
+when unassigned — then ordered by PR number, so one person's PRs sit
+together. Selecting
 a PR whose branch isn't checked out **switches your checkout to it** (safe —
 trpr requires a clean tree), then opens the comment view. `Ctrl-o` (or Esc)
 from the comment view jumps back to the list, and `Ctrl-i` (or Tab — same

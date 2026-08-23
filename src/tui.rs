@@ -453,9 +453,9 @@ fn draw_pr_list(
         .max()
         .unwrap_or(6)
         .clamp(6, 32);
-    let author_w = summaries
+    let owner_w = summaries
         .iter()
-        .map(|s| s.author.chars().count() + 1) // "@" prefix
+        .map(|s| s.triage_owner().chars().count() + 1) // "@" prefix
         .max()
         .unwrap_or(5)
         .clamp(5, 16);
@@ -466,7 +466,7 @@ fn draw_pr_list(
         .unwrap_or(1)
         .max(2);
     const BADGE_W: usize = 22; // "no news since last run"
-    let fixed = 2 + 1 + num_w + 1 + branch_w + 1 + author_w + 1 + open_w + 5 + 2 + BADGE_W + 2;
+    let fixed = 2 + 1 + num_w + 1 + branch_w + 1 + owner_w + 1 + open_w + 5 + 2 + BADGE_W + 2;
     let title_w = inner_w.saturating_sub(fixed).max(8);
 
     let rows: Vec<ListItem> = summaries
@@ -495,7 +495,7 @@ fn draw_pr_list(
                         "{current} #{:<num_w$} {} {} {:>open_w$} open  ",
                         s.number,
                         fit(&s.branch, branch_w),
-                        fit(&format!("@{}", s.author), author_w),
+                        fit(&format!("@{}", s.triage_owner()), owner_w),
                         s.unresolved,
                     ),
                     main_style,

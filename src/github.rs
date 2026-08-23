@@ -32,10 +32,20 @@ pub struct PrSummary {
     pub title: String,
     pub branch: String,
     pub author: String,
+    /// First assignee, when set.
+    pub assignee: Option<String>,
     /// Unresolved review threads + conversation comments.
     pub unresolved: usize,
     /// Newest comment activity (epoch seconds); 0 when none/unknown.
     pub last_activity: i64,
+}
+
+impl PrSummary {
+    /// Who's responsible for addressing this PR's reviews: the assignee, or
+    /// the author when unassigned. The list groups and sorts by this.
+    pub fn triage_owner(&self) -> &str {
+        self.assignee.as_deref().unwrap_or(&self.author)
+    }
 }
 
 /// One reviewable item shown in the TUI: an unresolved inline review thread,
@@ -157,6 +167,7 @@ impl Gh {
                     title
                     headRefName
                     author { login }
+                    assignees(first: 1) { nodes { login } }
                     comments(last: 1) { totalCount nodes { createdAt } }
                     reviewThreads(first: 100) {
                       nodes {
@@ -207,10 +218,21 @@ impl Gh {
                 title: pr["title"].as_str().unwrap_or("").to_string(),
                 branch: pr["headRefName"].as_str().unwrap_or("").to_string(),
                 author: pr["author"]["login"].as_str().unwrap_or("?").to_string(),
+                assignee: pr["assignees"]["nodes"][0]["login"]
+                    .as_str()
+                    .map(|s| s.to_string()),
                 unresolved,
                 last_activity,
             });
         }
+        // Grouped by who owns the triage (assignee, else author), PR number
+        // ascending within a group.
+        out.sort_by(|a, b| {
+            a.triage_owner()
+                .to_lowercase()
+                .cmp(&b.triage_owner().to_lowercase())
+                .then(a.number.cmp(&b.number))
+        });
         Ok(out)
     }
 
