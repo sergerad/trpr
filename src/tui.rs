@@ -46,7 +46,7 @@ pub enum Phase {
     Select,
     /// Editing the instruction for the selected item (modal vim editor).
     Edit {
-        editor: VimEditor,
+        editor: Box<VimEditor>,
     },
     Running,
     Done {
@@ -57,15 +57,14 @@ pub enum Phase {
 
 // ------------------------------------------------------------ vim editor ---
 
-/// A focused vim subset for the instruction box: Insert / Normal / Command
-/// modes. Esc goes to normal (never closes); `:q` cancels, `:wq`/`:x`/`:w`
-/// save. Enter is a plain newline in insert mode.
+/// A modal vim layer over `tui_textarea::TextArea` (which supplies the
+/// buffer, undo/redo history, and yank register). Esc goes to normal (never
+/// closes); `:q`/`:q!` cancel, `:wq`/`:x`/`:w` save. Enter is a plain
+/// newline in insert mode.
 pub struct VimEditor {
-    lines: Vec<String>,
-    row: usize,
-    col: usize,
+    ta: tui_textarea::TextArea<'static>,
     mode: VimMode,
-    /// Pending multi-key: 'g' (gg) or 'd' (dd).
+    /// Pending multi-key: 'g' (gg), 'd' (dd), 'y' (yy).
     pending: Option<char>,
     error: Option<String>,
 }
@@ -82,13 +81,41 @@ enum EditorAction {
     Cancel,
 }
 
+/// Hand conversion instead of tui-textarea's `From<KeyEvent>` impl, so a
+/// crossterm version skew between the two crates can never break input.
+fn to_input(key: KeyEvent) -> tui_textarea::Input {
+    use tui_textarea::Key;
+    let k = match key.code {
+        KeyCode::Char(c) => Key::Char(c),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::Enter => Key::Enter,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Tab => Key::Tab,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::Esc => Key::Esc,
+        _ => Key::Null,
+    };
+    tui_textarea::Input {
+        key: k,
+        ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+        alt: key.modifiers.contains(KeyModifiers::ALT),
+        shift: key.modifiers.contains(KeyModifiers::SHIFT),
+    }
+}
+
 impl VimEditor {
     fn new(text: &str) -> Self {
-        let lines: Vec<String> = if text.is_empty() {
-            vec![String::new()]
+        let mut ta = if text.is_empty() {
+            tui_textarea::TextArea::default()
         } else {
-            text.lines().map(|s| s.to_string()).collect()
+            tui_textarea::TextArea::from(text.lines())
         };
+        ta.set_cursor_line_style(Style::default());
         // Empty instruction: drop straight into insert so the common case is
         // "e, type, Esc, :wq".
         let mode = if text.is_empty() {
@@ -97,9 +124,7 @@ impl VimEditor {
             VimMode::Normal
         };
         Self {
-            lines,
-            row: 0,
-            col: 0,
+            ta,
             mode,
             pending: None,
             error: None,
@@ -107,30 +132,11 @@ impl VimEditor {
     }
 
     fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn line(&self) -> &str {
-        &self.lines[self.row]
-    }
-
-    fn line_len(&self) -> usize {
-        self.line().chars().count()
-    }
-
-    fn byte_idx(&self, col: usize) -> usize {
-        self.line()
-            .char_indices()
-            .nth(col)
-            .map(|(i, _)| i)
-            .unwrap_or(self.line().len())
-    }
-
-    fn clamp_normal(&mut self) {
-        self.col = self.col.min(self.line_len().saturating_sub(1));
+        self.ta.lines().join("\n")
     }
 
     fn handle(&mut self, key: KeyEvent) -> EditorAction {
+        use tui_textarea::CursorMove as M;
         self.error = None;
 
         // Command mode first: its buffer lives in the mode enum.
@@ -166,161 +172,111 @@ impl VimEditor {
             match key.code {
                 KeyCode::Esc => {
                     self.mode = VimMode::Normal;
-                    self.col = self.col.saturating_sub(1);
-                    self.clamp_normal();
+                    self.ta.move_cursor(M::Back);
                 }
-                KeyCode::Enter => {
-                    let idx = self.byte_idx(self.col);
-                    let rest = self.lines[self.row].split_off(idx);
-                    self.lines.insert(self.row + 1, rest);
-                    self.row += 1;
-                    self.col = 0;
+                _ => {
+                    self.ta.input(to_input(key));
                 }
-                KeyCode::Backspace => {
-                    if self.col > 0 {
-                        let idx = self.byte_idx(self.col - 1);
-                        self.lines[self.row].remove(idx);
-                        self.col -= 1;
-                    } else if self.row > 0 {
-                        let tail = self.lines.remove(self.row);
-                        self.row -= 1;
-                        self.col = self.line_len();
-                        self.lines[self.row].push_str(&tail);
-                    }
-                }
-                KeyCode::Tab => {
-                    let idx = self.byte_idx(self.col);
-                    self.lines[self.row].insert_str(idx, "  ");
-                    self.col += 2;
-                }
-                KeyCode::Char(c) => {
-                    let idx = self.byte_idx(self.col);
-                    self.lines[self.row].insert(idx, c);
-                    self.col += 1;
-                }
-                KeyCode::Left => self.col = self.col.saturating_sub(1),
-                KeyCode::Right => self.col = (self.col + 1).min(self.line_len()),
-                KeyCode::Up => {
-                    self.row = self.row.saturating_sub(1);
-                    self.col = self.col.min(self.line_len());
-                }
-                KeyCode::Down => {
-                    self.row = (self.row + 1).min(self.lines.len() - 1);
-                    self.col = self.col.min(self.line_len());
-                }
-                _ => {}
             }
             return EditorAction::Continue;
         }
 
         // Normal mode.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let pending = self.pending.take();
         match (pending, key.code) {
             (Some('g'), KeyCode::Char('g')) => {
-                self.row = 0;
-                self.col = 0;
+                self.ta.move_cursor(M::Top);
+                self.ta.move_cursor(M::Head);
             }
-            (Some('d'), KeyCode::Char('d')) => {
-                self.lines.remove(self.row);
-                if self.lines.is_empty() {
-                    self.lines.push(String::new());
-                }
-                self.row = self.row.min(self.lines.len() - 1);
-                self.clamp_normal();
-            }
+            (Some('d'), KeyCode::Char('d')) => self.line_op(true),
+            (Some('y'), KeyCode::Char('y')) => self.line_op(false),
             (_, KeyCode::Char('g')) => self.pending = Some('g'),
             (_, KeyCode::Char('d')) => self.pending = Some('d'),
+            (_, KeyCode::Char('y')) => self.pending = Some('y'),
             (_, KeyCode::Char(':')) => self.mode = VimMode::Command(String::new()),
             (_, KeyCode::Char('i')) => self.mode = VimMode::Insert,
             (_, KeyCode::Char('a')) => {
-                self.col = (self.col + 1).min(self.line_len());
+                self.ta.move_cursor(M::Forward);
                 self.mode = VimMode::Insert;
             }
             (_, KeyCode::Char('I')) => {
-                self.col = 0;
+                self.ta.move_cursor(M::Head);
                 self.mode = VimMode::Insert;
             }
             (_, KeyCode::Char('A')) => {
-                self.col = self.line_len();
+                self.ta.move_cursor(M::End);
                 self.mode = VimMode::Insert;
             }
             (_, KeyCode::Char('o')) => {
-                self.lines.insert(self.row + 1, String::new());
-                self.row += 1;
-                self.col = 0;
+                self.ta.move_cursor(M::End);
+                self.ta.insert_newline();
                 self.mode = VimMode::Insert;
             }
             (_, KeyCode::Char('O')) => {
-                self.lines.insert(self.row, String::new());
-                self.col = 0;
+                self.ta.move_cursor(M::Head);
+                self.ta.insert_newline();
+                self.ta.move_cursor(M::Up);
                 self.mode = VimMode::Insert;
             }
             (_, KeyCode::Char('x')) => {
-                if self.line_len() > 0 {
-                    let idx = self.byte_idx(self.col);
-                    self.lines[self.row].remove(idx);
-                    self.clamp_normal();
-                }
+                self.ta.delete_next_char();
             }
-            (_, KeyCode::Char('h') | KeyCode::Left) => self.col = self.col.saturating_sub(1),
-            (_, KeyCode::Char('l') | KeyCode::Right) => {
-                self.col = (self.col + 1).min(self.line_len().saturating_sub(1));
+            // D: cut to end of line (fills the yank register).
+            (_, KeyCode::Char('D')) => {
+                self.ta.delete_line_by_end();
             }
-            (_, KeyCode::Char('j') | KeyCode::Down) => {
-                self.row = (self.row + 1).min(self.lines.len() - 1);
-                self.clamp_normal();
+            // C: change to end of line — cut to EOL, then insert.
+            (_, KeyCode::Char('C')) => {
+                self.ta.delete_line_by_end();
+                self.mode = VimMode::Insert;
             }
-            (_, KeyCode::Char('k') | KeyCode::Up) => {
-                self.row = self.row.saturating_sub(1);
-                self.clamp_normal();
+            // p: paste the yank register (filled by dd/yy/D/C/x).
+            (_, KeyCode::Char('p')) => {
+                self.ta.paste();
             }
-            (_, KeyCode::Char('0')) => self.col = 0,
-            (_, KeyCode::Char('$')) => self.col = self.line_len().saturating_sub(1),
+            (_, KeyCode::Char('u')) => {
+                self.ta.undo();
+            }
+            (_, KeyCode::Char('r')) if ctrl => {
+                self.ta.redo();
+            }
+            (_, KeyCode::Char('h') | KeyCode::Left) => self.ta.move_cursor(M::Back),
+            (_, KeyCode::Char('l') | KeyCode::Right) => self.ta.move_cursor(M::Forward),
+            (_, KeyCode::Char('j') | KeyCode::Down) => self.ta.move_cursor(M::Down),
+            (_, KeyCode::Char('k') | KeyCode::Up) => self.ta.move_cursor(M::Up),
+            (_, KeyCode::Char('0')) => self.ta.move_cursor(M::Head),
+            (_, KeyCode::Char('$')) => self.ta.move_cursor(M::End),
             (_, KeyCode::Char('G')) => {
-                self.row = self.lines.len() - 1;
-                self.clamp_normal();
+                self.ta.move_cursor(M::Bottom);
+                self.ta.move_cursor(M::Head);
             }
-            (_, KeyCode::Char('w')) => self.word_forward(),
-            (_, KeyCode::Char('b')) => self.word_back(),
+            (_, KeyCode::Char('w')) => self.ta.move_cursor(M::WordForward),
+            (_, KeyCode::Char('b')) => self.ta.move_cursor(M::WordBack),
             _ => {}
         }
         EditorAction::Continue
     }
 
-    fn word_forward(&mut self) {
-        let chars: Vec<char> = self.line().chars().collect();
-        let mut c = self.col;
-        while c < chars.len() && !chars[c].is_whitespace() {
-            c += 1;
-        }
-        while c < chars.len() && chars[c].is_whitespace() {
-            c += 1;
-        }
-        if c >= chars.len() && self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
+    /// dd (cut=true) / yy (cut=false): select the whole line including the
+    /// trailing newline when there is one, so `p` behaves ~linewise.
+    fn line_op(&mut self, cut: bool) {
+        use tui_textarea::CursorMove as M;
+        let (row, col) = self.ta.cursor();
+        self.ta.move_cursor(M::Head);
+        self.ta.start_selection();
+        if row + 1 < self.ta.lines().len() {
+            self.ta.move_cursor(M::Down);
+            self.ta.move_cursor(M::Head);
         } else {
-            self.col = c.min(chars.len().saturating_sub(1));
+            self.ta.move_cursor(M::End);
         }
-    }
-
-    fn word_back(&mut self) {
-        if self.col == 0 {
-            if self.row > 0 {
-                self.row -= 1;
-                self.col = self.line_len().saturating_sub(1);
-            }
-            return;
+        if cut {
+            self.ta.cut();
+        } else {
+            self.ta.copy();
+            self.ta.move_cursor(M::Jump(row as u16, col as u16));
         }
-        let chars: Vec<char> = self.line().chars().collect();
-        let mut c = self.col;
-        while c > 0 && chars[c - 1].is_whitespace() {
-            c -= 1;
-        }
-        while c > 0 && !chars[c - 1].is_whitespace() {
-            c -= 1;
-        }
-        self.col = c;
     }
 }
 
@@ -948,7 +904,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Flow {
                         _ => String::new(),
                     };
                     app.phase = Phase::Edit {
-                        editor: VimEditor::new(&existing),
+                        editor: Box::new(VimEditor::new(&existing)),
                     };
                 }
             }
@@ -1346,7 +1302,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::raw(help));
         }
         Phase::Edit { .. } => lines.push(Line::raw(
-            "vim editor: i/a/o insert · Esc normal · hjkl w b 0 $ gg G x dd · :wq save · :q cancel",
+            "vim: i/a/o insert · Esc normal · hjkl w b 0 $ gg G · x dd D C · yy p · u ^r · :wq save · :q cancel",
         )),
         Phase::Running => {
             let elapsed = app.run_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -1386,39 +1342,26 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_edit_popup(f: &mut Frame, ed: &VimEditor, area: Rect) {
-    let height = ((ed.lines.len() as u16) + 3).clamp(6, 16).min(area.height);
+    let height = ((ed.ta.lines().len() as u16) + 3)
+        .clamp(6, 16)
+        .min(area.height);
     let popup = centered(area, 70, height);
     f.render_widget(Clear, popup);
 
-    // Text window scrolled so the cursor row is always visible.
-    let text_h = popup.height.saturating_sub(3) as usize; // borders + status line
-    let top = ed.row.saturating_sub(text_h.saturating_sub(1));
-    let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
-    let mut text: Vec<Line> = Vec::new();
-    for (i, line) in ed.lines.iter().enumerate().skip(top).take(text_h) {
-        if i == ed.row {
-            // Split at the cursor and render the cursor cell reversed.
-            let before: String = line.chars().take(ed.col).collect();
-            let cursor: String = line
-                .chars()
-                .nth(ed.col)
-                .map(String::from)
-                .unwrap_or_else(|| " ".into());
-            let after: String = line.chars().skip(ed.col + 1).collect();
-            text.push(Line::from(vec![
-                Span::raw(before),
-                Span::styled(cursor, cursor_style),
-                Span::raw(after),
-            ]));
-        } else {
-            text.push(Line::raw(line.clone()));
-        }
-    }
+    let block = Block::bordered().title("instruction — :wq save · :q cancel");
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let [text_area, status_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+
+    // The TextArea widget renders its own cursor and scrolls to keep it visible.
+    f.render_widget(&ed.ta, text_area);
+
     // Status line: mode / command line / error, vim-style.
     let status = match &ed.mode {
         VimMode::Command(cmd) => Line::from(vec![
             Span::raw(format!(":{cmd}")),
-            Span::styled(" ", cursor_style),
+            Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)),
         ]),
         VimMode::Insert => Line::styled("-- INSERT --", Style::new().add_modifier(Modifier::BOLD)),
         VimMode::Normal => match &ed.error {
@@ -1426,15 +1369,7 @@ fn draw_edit_popup(f: &mut Frame, ed: &VimEditor, area: Rect) {
             None => Line::styled("-- NORMAL --", Style::new().fg(Color::DarkGray)),
         },
     };
-    while text.len() < text_h {
-        text.push(Line::raw(""));
-    }
-    text.push(status);
-
-    f.render_widget(
-        Paragraph::new(text).block(Block::bordered().title("instruction — :wq save · :q cancel")),
-        popup,
-    );
+    f.render_widget(Paragraph::new(status), status_area);
 }
 
 fn centered(area: Rect, pct_x: u16, height: u16) -> Rect {

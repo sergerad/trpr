@@ -121,7 +121,7 @@ focus (Tab toggles list ↔ detail).
 |---|---|
 | PR list | `j`/`k` move · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · Enter open (switches branch if needed) · `Ctrl-i`/Tab resume the last-left comment view (state intact) · `r` refresh · `q`/Esc quit |
 | Select | Tab toggle focus · `j`/`k` move/scroll · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `r` run · `Ctrl-o`/Esc back to list (list mode) · `q` quit |
-| Instruction editor | **modal (vim)**: `i`/`a`/`I`/`A`/`o`/`O` insert · Esc → normal · `h`/`j`/`k`/`l`, `w`/`b`, `0`/`$`, `gg`/`G` motion · `x`, `dd` delete · `:wq`/`:x`/`:w` save & close · `:q`/`:q!` cancel · Enter is a plain newline in insert mode |
+| Instruction editor | **modal (vim)**: `i`/`a`/`I`/`A`/`o`/`O` insert · Esc → normal · `h`/`j`/`k`/`l`, `w`/`b`, `0`/`$`, `gg`/`G` motion · `x`, `dd`, `D` delete · `C` change-to-EOL · `yy` yank · `p` paste · `u` undo, `Ctrl-r` redo · `:wq`/`:x`/`:w` save & close · `:q`/`:q!` cancel · Enter is a plain newline in insert mode |
 | Running | `q` abort (kills the agent) · `j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u` scroll |
 | Done | Esc back to list (list mode) · `q` quit · scroll as above |
 
