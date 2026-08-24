@@ -155,7 +155,9 @@ impl Gh {
 
     /// All open PRs with enough detail for the list screen, in one GraphQL
     /// round-trip: unresolved-thread counts and latest comment activity.
-    pub async fn open_pr_summaries(&self, repo: &str) -> Result<Vec<PrSummary>> {
+    /// `viewer`: your login — your own comments never count as activity, so
+    /// your replies don't make your PRs look like they have news.
+    pub async fn open_pr_summaries(&self, repo: &str, viewer: &str) -> Result<Vec<PrSummary>> {
         let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
         let query = r#"
             query($owner: String!, $name: String!) {
@@ -168,11 +170,11 @@ impl Gh {
                     headRefName
                     author { login }
                     assignees(first: 1) { nodes { login } }
-                    comments(last: 1) { totalCount nodes { createdAt } }
+                    comments(last: 10) { totalCount nodes { createdAt author { login } } }
                     reviewThreads(first: 100) {
                       nodes {
                         isResolved
-                        comments(last: 1) { nodes { createdAt } }
+                        comments(last: 10) { nodes { createdAt author { login } } }
                       }
                     }
                   }
@@ -188,6 +190,23 @@ impl Gh {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        // Newest comment not authored by the viewer (or a bot).
+        let others_latest = |comments: &serde_json::Value| -> i64 {
+            comments["nodes"]
+                .as_array()
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|c| {
+                            let login = c["author"]["login"].as_str().unwrap_or("?");
+                            login != viewer && !is_bot(login, None)
+                        })
+                        .filter_map(|c| c["createdAt"].as_str().and_then(parse_epoch))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
+        };
         for pr in nodes {
             let mut unresolved = 0usize;
             let mut last_activity = 0i64;
@@ -199,20 +218,10 @@ impl Gh {
                     continue;
                 }
                 unresolved += 1;
-                if let Some(ts) = t["comments"]["nodes"][0]["createdAt"]
-                    .as_str()
-                    .and_then(parse_epoch)
-                {
-                    last_activity = last_activity.max(ts);
-                }
+                last_activity = last_activity.max(others_latest(&t["comments"]));
             }
             unresolved += pr["comments"]["totalCount"].as_u64().unwrap_or(0) as usize;
-            if let Some(ts) = pr["comments"]["nodes"][0]["createdAt"]
-                .as_str()
-                .and_then(parse_epoch)
-            {
-                last_activity = last_activity.max(ts);
-            }
+            last_activity = last_activity.max(others_latest(&pr["comments"]));
             out.push(PrSummary {
                 number: pr["number"].as_u64().unwrap_or(0),
                 title: pr["title"].as_str().unwrap_or("").to_string(),
@@ -225,15 +234,24 @@ impl Gh {
                 last_activity,
             });
         }
-        // Grouped by who owns the triage (assignee, else author), PR number
-        // ascending within a group.
+        // Newest (non-self) comment activity first — the inbox ordering.
         out.sort_by(|a, b| {
-            a.triage_owner()
-                .to_lowercase()
-                .cmp(&b.triage_owner().to_lowercase())
-                .then(a.number.cmp(&b.number))
+            b.last_activity
+                .cmp(&a.last_activity)
+                .then(b.number.cmp(&a.number))
         });
         Ok(out)
+    }
+
+    /// Who the token authenticates as — trpr's automatic user identity.
+    pub async fn viewer(&self) -> Result<String> {
+        let v = self
+            .graphql("query { viewer { login } }", serde_json::json!({}))
+            .await?;
+        Ok(v["data"]["viewer"]["login"]
+            .as_str()
+            .unwrap_or("?")
+            .to_string())
     }
 
     async fn graphql(

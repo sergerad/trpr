@@ -86,17 +86,18 @@ async fn run_inner(
         .replace("{{ITEMS_JSON}}", &ctx.items_json);
     std::fs::write(ctx.run_dir.join("prompt.md"), &prompt)?;
 
-    let mut child = tokio::process::Command::new(&ctx.claude_bin)
-        .args([
-            "-p",
-            "--output-format",
-            "stream-json", // JSONL event stream; --verbose required with it in print mode
-            "--verbose",
-            "--max-turns",
-            &ctx.max_turns.to_string(),
-            "--settings",
-            &settings_path.to_string_lossy(),
-        ])
+    let mut cmd = tokio::process::Command::new(&ctx.claude_bin);
+    cmd.args([
+        "-p",
+        "--output-format",
+        "stream-json", // JSONL event stream; --verbose required with it in print mode
+        "--verbose",
+        "--max-turns",
+        &ctx.max_turns.to_string(),
+        "--settings",
+        &settings_path.to_string_lossy(),
+    ]);
+    let mut child = cmd
         .current_dir(&ctx.repo_root)
         // The read-only PAT is the only GitHub credential the agent sees —
         // `gh` inside the run cannot write to GitHub.

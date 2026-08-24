@@ -84,6 +84,7 @@ async fn direct_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Re
             )
         })?;
     eprintln!("PR #{}: {} — fetching comments…", pr.number, pr.title);
+    tui::mark_seen(&gctx.repo, pr.number);
     let items = gh.unresolved_items(&gctx.repo, pr.number).await?;
     if items.is_empty() {
         println!(
@@ -112,7 +113,11 @@ async fn direct_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Re
 /// left comment view is kept — Ctrl-i (or Tab) on the list resumes it with
 /// all in-progress instructions intact, vim-jumplist style.
 async fn list_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Result<()> {
+    // Who you are on GitHub — derived from the token, no config needed.
+    let viewer = gh.viewer().await.context("fetching your GitHub identity")?;
+    eprintln!("authenticated as @{viewer}");
     let mut current_branch = gctx.branch.clone();
+    let mut mine_only = true;
     let mut session = tui::Session::new();
     let mut notice: Option<String> = None;
     // The most recently left comment view — the Ctrl-i "forward" slot.
@@ -123,23 +128,39 @@ async fn list_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Resu
         if let Err(e) = session.show_message("fetching open PRs…") {
             break 'outer Err(e);
         }
-        let summaries = match gh.open_pr_summaries(&gctx.repo).await {
+        let summaries = match gh.open_pr_summaries(&gctx.repo, &viewer).await {
             Ok(s) => s,
             Err(e) => break 'outer Err(e),
         };
         if summaries.is_empty() {
             break 'outer Ok(());
         }
-        let last_runs = tui::last_run_times(&gctx.repo);
+        let mut view: Vec<github::PrSummary> = if mine_only {
+            summaries
+                .iter()
+                .filter(|s| s.author == viewer)
+                .cloned()
+                .collect()
+        } else {
+            summaries.clone()
+        };
+        if mine_only && view.is_empty() {
+            view = summaries.clone();
+            if notice.is_none() {
+                notice = Some(format!("no open PRs by @{viewer} — showing all"));
+            }
+        }
+        let seen = tui::load_seen(&gctx.repo);
 
         let outcome = match session
             .pick_pr(
                 &gctx.repo,
                 &current_branch,
-                &summaries,
-                &last_runs,
+                &view,
+                &seen,
                 notice.as_deref(),
                 stored.is_some(),
+                mine_only,
             )
             .await
         {
@@ -151,6 +172,10 @@ async fn list_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Resu
         let mut app = match outcome {
             tui::PickOutcome::Quit => break 'outer Ok(()),
             tui::PickOutcome::Refresh => continue,
+            tui::PickOutcome::ToggleMine => {
+                mine_only = !mine_only;
+                continue;
+            }
             tui::PickOutcome::Forward => match stored.take() {
                 // Resume the left view as-is: no refetch, instructions intact.
                 Some(a) if a.branch == current_branch => a,
@@ -160,6 +185,7 @@ async fn list_mode(gctx: git::GitCtx, gh: github::Gh, actx: tui::AppCtx) -> Resu
                 }
             },
             tui::PickOutcome::Pr(picked) => {
+                tui::mark_seen(&gctx.repo, picked.number);
                 if picked.branch != current_branch {
                     if let Err(e) =
                         session.show_message(&format!("switching to {}…", picked.branch))

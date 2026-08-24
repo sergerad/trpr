@@ -9,12 +9,14 @@ trpr           # PR-list mode: browse the repo's open PRs, pick one to triage
 trpr .         # direct mode: straight to the PR of the checked-out branch
 ```
 
-**PR-list mode** (bare `trpr`) shows every open PR with its branch,
-triage owner, unresolved-comment count, and whether there's been **NEW
-activity since your last trpr run** on that PR (`never run` if there hasn't
-been one). Rows are grouped by triage owner — the assignee, or the author
-when unassigned — then ordered by PR number, so one person's PRs sit
-together. Selecting
+**PR-list mode** (bare `trpr`) is user-aware: trpr asks GitHub who your
+token belongs to (no config) and shows **your PRs by default** (`m` toggles
+to all; falls back to all automatically if you have none). Rows are ordered
+by **newest comment activity first**, where "activity" deliberately excludes
+your own comments and bots — your replies never make your PRs look like news.
+Each row shows the activity age and a seen-based badge: `● NEW 2h` (yellow)
+means someone commented since you last opened that PR's comments in trpr;
+`seen · 2h` means you've looked since. Selecting
 a PR whose branch isn't checked out **switches your checkout to it** (safe —
 trpr requires a clean tree), then opens the comment view. `Ctrl-o` (or Esc)
 from the comment view jumps back to the list, and `Ctrl-i` (or Tab — same
@@ -119,7 +121,7 @@ focus (Tab toggles list ↔ detail).
 
 | Phase | Keys |
 |---|---|
-| PR list | `j`/`k` move · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · Enter open (switches branch if needed) · `Ctrl-i`/Tab resume the last-left comment view (state intact) · `r` refresh · `q`/Esc quit |
+| PR list | `j`/`k` move · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · Enter open (switches branch if needed) · `m` toggle your/all PRs · `Ctrl-i`/Tab resume the last-left comment view (state intact) · `r` refresh · `q`/Esc quit |
 | Select | Tab toggle focus · `j`/`k` move/scroll · `gg`/`G` top/bottom · `Ctrl-d`/`Ctrl-u` jump · `a` implement-as-stated · `e`/Enter edit instruction · `x` ignore · `r` run · `Ctrl-o`/Esc back to list (list mode) · `q` quit |
 | Instruction editor | **modal (vim)**: `i`/`a`/`I`/`A`/`o`/`O` insert · Esc → normal · `h`/`j`/`k`/`l`, `w`/`b`, `0`/`$`, `gg`/`G` motion · `x`, `dd`, `D` delete · `C` change-to-EOL · `yy` yank · `p` paste · `u` undo, `Ctrl-r` redo · `:wq`/`:x`/`:w` save & close · `:q`/`:q!` cancel · Enter is a plain newline in insert mode |
 | Running | `q` abort (kills the agent) · `j`/`k`, `gg`/`G`, `Ctrl-d`/`Ctrl-u` scroll |

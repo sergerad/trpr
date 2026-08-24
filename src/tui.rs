@@ -391,6 +391,8 @@ pub enum PickOutcome {
     Pr(PrSummary),
     /// Ctrl-i / Tab: resume the most recently left comment view, state intact.
     Forward,
+    /// 'm': toggle between "my PRs" and "all PRs".
+    ToggleMine,
 }
 
 /// One terminal + one key-reader thread for the whole program, hosting both
@@ -432,16 +434,18 @@ impl Session {
         Ok(())
     }
 
-    /// The PR-list screen. `last_runs`: pr number → epoch of the newest trpr
-    /// run, for the NEW-since-last-run indicator.
+    /// The PR-list screen. `seen`: pr number → epoch of when you last opened
+    /// that PR's comments, for the NEW indicator.
+    #[allow(clippy::too_many_arguments)]
     pub async fn pick_pr(
         &mut self,
         repo: &str,
         current_branch: &str,
         summaries: &[PrSummary],
-        last_runs: &std::collections::HashMap<u64, i64>,
+        seen: &std::collections::HashMap<u64, i64>,
         notice: Option<&str>,
         can_forward: bool,
+        mine_only: bool,
     ) -> Result<PickOutcome> {
         let mut selected = 0usize;
         let mut pending_g = false;
@@ -452,10 +456,11 @@ impl Session {
                     repo,
                     current_branch,
                     summaries,
-                    last_runs,
+                    seen,
                     selected,
                     notice,
                     can_forward,
+                    mine_only,
                 )
             })?;
             let Some(ev) = self.key_rx.recv().await else {
@@ -470,6 +475,7 @@ impl Session {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(PickOutcome::Quit),
                 KeyCode::Char('r') => return Ok(PickOutcome::Refresh),
+                KeyCode::Char('m') => return Ok(PickOutcome::ToggleMine),
                 // Ctrl-i is Tab in most terminals (both 0x09) — accept either
                 // as vim-style "forward" back into the last comment view.
                 KeyCode::Tab if can_forward => return Ok(PickOutcome::Forward),
@@ -594,37 +600,46 @@ impl Session {
     }
 }
 
-/// Newest run timestamp per PR for this repo, from the run-dir mtimes.
-pub fn last_run_times(repo: &str) -> std::collections::HashMap<u64, i64> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(base) = data_dir() else { return out };
-    let repo_dir = base.join("runs").join(repo.replace('/', "__"));
-    let Ok(entries) = std::fs::read_dir(&repo_dir) else {
-        return out;
-    };
-    for pr_entry in entries.flatten() {
-        let name = pr_entry.file_name().to_string_lossy().to_string();
-        let Some(num) = name.strip_prefix("pr-").and_then(|v| v.parse::<u64>().ok()) else {
-            continue;
-        };
-        let Ok(runs) = std::fs::read_dir(pr_entry.path()) else {
-            continue;
-        };
-        let newest = runs
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.metadata().ok()?.modified().ok())
-            .filter_map(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs() as i64)
-            })
-            .max();
-        if let Some(ts) = newest {
-            out.insert(num, ts);
-        }
+/// Per-repo "seen" state: pr number → epoch of when you last opened that
+/// PR's comment view. Drives the NEW indicator — independent of runs.
+fn seen_path(repo: &str) -> Result<PathBuf> {
+    Ok(data_dir()?
+        .join("runs")
+        .join(repo.replace('/', "__"))
+        .join("seen.json"))
+}
+
+pub fn load_seen(repo: &str) -> std::collections::HashMap<u64, i64> {
+    seen_path(repo)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort: losing this file costs highlight accuracy, not correctness.
+pub fn mark_seen(repo: &str, pr: u64) {
+    let mut seen = load_seen(repo);
+    seen.insert(pr, chrono::Utc::now().timestamp());
+    let Ok(path) = seen_path(repo) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    out
+    if let Ok(json) = serde_json::to_string_pretty(&seen) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// Compact relative age: "5m", "3h", "2d".
+fn rel_age(epoch: i64) -> String {
+    let s = (chrono::Utc::now().timestamp() - epoch).max(0);
+    if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -633,10 +648,11 @@ fn draw_pr_list(
     repo: &str,
     current_branch: &str,
     summaries: &[PrSummary],
-    last_runs: &std::collections::HashMap<u64, i64>,
+    seen: &std::collections::HashMap<u64, i64>,
     selected: usize,
     notice: Option<&str>,
     can_forward: bool,
+    mine_only: bool,
 ) {
     let [header, main, footer] = Layout::vertical([
         Constraint::Length(2),
@@ -690,19 +706,29 @@ fn draw_pr_list(
         .max()
         .unwrap_or(1)
         .max(2);
-    const BADGE_W: usize = 22; // "no news since last run"
+    const BADGE_W: usize = 12; // "seen · 12d" / "● NEW 12d"
     let fixed = 2 + 1 + num_w + 1 + branch_w + 1 + owner_w + 1 + open_w + 5 + 2 + BADGE_W + 2;
     let title_w = inner_w.saturating_sub(fixed).max(8);
 
     let rows: Vec<ListItem> = summaries
         .iter()
         .map(|s| {
-            let (badge, badge_style) = match last_runs.get(&s.number) {
-                Some(t) if s.last_activity > *t => {
-                    ("NEW since last run", Style::new().fg(Color::Yellow))
-                }
-                Some(_) => ("no news since last run", Style::new().fg(Color::DarkGray)),
-                None => ("never run", Style::new().fg(Color::DarkGray)),
+            // NEW = someone (not you, not a bot) commented since you last
+            // opened this PR's comments in trpr.
+            let is_new =
+                s.last_activity > 0 && s.last_activity > seen.get(&s.number).copied().unwrap_or(0);
+            let (badge, badge_style) = if s.last_activity == 0 {
+                ("—".to_string(), Style::new().fg(Color::DarkGray))
+            } else if is_new {
+                (
+                    format!("● NEW {}", rel_age(s.last_activity)),
+                    Style::new().fg(Color::Yellow),
+                )
+            } else {
+                (
+                    format!("seen · {}", rel_age(s.last_activity)),
+                    Style::new().fg(Color::DarkGray),
+                )
             };
             let current = if s.branch == current_branch {
                 "▶"
@@ -725,20 +751,24 @@ fn draw_pr_list(
                     ),
                     main_style,
                 ),
-                Span::styled(fit(badge, BADGE_W), badge_style),
+                Span::styled(fit(&badge, BADGE_W), badge_style),
                 Span::styled(format!("  {}", fit(&s.title, title_w)), main_style),
             ]))
         })
         .collect();
     let list = List::new(rows)
-        .block(Block::bordered().title(format!("{} open PR(s)", summaries.len())))
+        .block(Block::bordered().title(format!(
+            "{} open PR(s) — {} · newest activity first",
+            summaries.len(),
+            if mine_only { "yours" } else { "all" },
+        )))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
     state.select(Some(selected.min(summaries.len().saturating_sub(1))));
     f.render_stateful_widget(list, main, &mut state);
 
     let mut help =
-        "j/k move · gg/G top/bottom · ^d/^u jump · Enter open · r refresh · q quit".to_string();
+        "j/k move · gg/G · ^d/^u · Enter open · m yours/all · r refresh · q quit".to_string();
     if can_forward {
         help.push_str(" · ^i/Tab resume last view");
     }
