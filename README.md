@@ -9,6 +9,8 @@ trpr           # PR-list mode: browse the repo's open PRs, pick one to triage
 trpr .         # direct mode: straight to the PR of the checked-out branch
 ```
 
+<img width="960" height="461" alt="trpr-recording" src="https://github.com/user-attachments/assets/10e9985e-f2cb-426e-b25d-495ae5c176ce" />
+
 ## PR-list mode (`trpr`)
 
 A triage inbox for the repo's open PRs:
