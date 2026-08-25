@@ -9,39 +9,40 @@ trpr           # PR-list mode: browse the repo's open PRs, pick one to triage
 trpr .         # direct mode: straight to the PR of the checked-out branch
 ```
 
-**PR-list mode** (bare `trpr`) is user-aware: trpr asks GitHub who your
-token belongs to (no config) and shows **your PRs by default** (`m` toggles
-to all; falls back to all automatically if you have none). Rows are ordered
-by **newest comment activity first**, where "activity" deliberately excludes
-your own comments and bots — your replies never make your PRs look like news.
-Each row shows the activity age and a seen-based badge: `● NEW 2h` (yellow)
-means someone commented since you last opened that PR's comments in trpr;
-`seen · 2h` means you've looked since. Selecting
-a PR whose branch isn't checked out **switches your checkout to it** (safe —
-trpr requires a clean tree), then opens the comment view. `Ctrl-o` (or Esc)
-from the comment view jumps back to the list, and `Ctrl-i` (or Tab — same
-key in most terminals) on the list resumes the view you left **with your
-in-progress instructions intact**, vim-jumplist style. Enter on a PR always
-opens it fresh (re-fetches comments); opening a different PR clears the
-resume slot.
+## PR-list mode (`trpr`)
 
-**Direct mode** (`trpr <path>`, e.g. `trpr .`) skips the list and jumps to
-the PR of that checkout's current branch — errors out if there's no open PR.
+A triage inbox for the repo's open PRs:
 
-Either way you land in the comment view:
+- **User-aware.** trpr derives your identity from the token — no config.
+  Your PRs are shown by default; `m` toggles all.
+- **Ordered by newest comment activity.** Your own comments and bots don't
+  count as activity, so replying never makes a PR look like news.
+- **Seen-based badges.** `● NEW 2h` = someone commented since you last
+  opened that PR in trpr. `seen · 2h` = you're caught up.
+- **Enter opens a PR**, switching your checkout to its branch when needed
+  (safe: trpr requires a clean tree). Opening always re-fetches comments.
+- **Jumplist navigation.** `Ctrl-o` (or Esc) returns to the list; `Ctrl-i`
+  (or Tab) resumes the view you left, in-progress instructions intact.
 
-1. **Select** — browse the comments (inline review threads + conversation-tab
-   comments, bots filtered out).
-2. **Instruct** — per comment: `a` = implement as the reviewer stated,
-   `e` = write your own instruction ("do this but use a builder instead",
-   "just add a TODO"), `x` = ignore.
-3. **Run** — `r` launches one Claude Code agent run that implements every
-   instructed comment, **editing your checkout in place and committing one
-   commit per handled comment**. The TUI streams the agent's thinking, tool
-   calls, and output live.
-4. **Review, then push** — when it's done, the commits are on your branch.
-   `git log` / `git show` them, drop or reword what you don't like, then
-   push yourself. trpr never pushes and never posts to GitHub.
+## Direct mode (`trpr <path>`)
+
+Skips the list: `trpr .` jumps straight to the PR of the checkout's current
+branch, and errors out if there's no open PR.
+
+## The comment view
+
+Either mode lands here — one screen, four steps:
+
+1. **Select** — browse the PR's unresolved comments (inline review threads
+   plus conversation tab; bots hidden).
+2. **Instruct** — per comment: `a` implement as stated, `e` write your own
+   instruction, `x` ignore.
+3. **Run** — `r` starts one agent run for everything you instructed. It
+   edits your checkout in place, committing **one commit per handled
+   comment**, and streams its thinking and tool calls live.
+4. **Review, then push** — the commits are on your branch: `git log` them,
+   drop or reword what you don't like, push yourself. trpr never pushes and
+   never posts to GitHub.
 
 Each commit carries structured trailers naming the comment it addresses:
 
